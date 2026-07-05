@@ -1,15 +1,27 @@
 """
 User-profile guided dynamic hyperedge pool for long-term conversational memory.
 
-This module adds a fast personalized retrieval channel on top of the original
-Topic / Episode / Fact memory base.  It does not call LLMs or external APIs.
-The pool keeps high-utility profile hyperedges such as user preferences, goals,
-habits, current state, domain knowledge and temporal evolution chains.
+This module implements a semi-automatic user-profile hyperedge pool on top of
+Topic / Episode / Fact base memories.  It is retrieval-only and does not call
+LLMs or external APIs.
 
-Core idea:
-    base memory nodes  ->  reward-guided user-profile hyperedge pool
-    query              ->  profile fast channel first
-                       ->  fallback to original facts/path when insufficient
+Main design:
+    1. rule mode:
+       Predefined seed profile types such as preference, goal, habit and
+       current_state.  Efficient and interpretable, but closed-set.
+
+    2. unsupervised mode:
+       No fixed profile type is assumed.  Low-level memory facts are grouped
+       by similarity and stable clusters are promoted into auto_discovered
+       profile hyperedges.  Flexible, but noisier with little data.
+
+    3. hybrid mode:
+       High-confidence seed categories are used directly; low-confidence facts
+       enter a discovery buffer and are clustered into new profile hyperedges.
+       This is the recommended setting.
+
+Retrieval follows:
+    query -> profile fast channel -> fallback to base facts/path if insufficient
 """
 
 from __future__ import annotations
@@ -56,6 +68,12 @@ class NodeType(str, Enum):
     FACT = "fact"
 
 
+class ProfileTypingMode(str, Enum):
+    RULE = "rule"
+    UNSUPERVISED = "unsupervised"
+    HYBRID = "hybrid"
+
+
 class ProfileHyperedgeType(str, Enum):
     PREFERENCE = "preference"
     GOAL = "goal"
@@ -65,6 +83,7 @@ class ProfileHyperedgeType(str, Enum):
     TEMPORAL_EVOLUTION = "temporal_evolution"
     EVIDENCE_GROUP = "evidence_group"
     SUPERSEDE = "supersede"
+    AUTO_DISCOVERED = "auto_discovered"
     OTHER = "other"
 
 
@@ -98,31 +117,35 @@ class ProfileHyperedge:
     updated_at: float = field(default_factory=time.time)
     time_span: Tuple[Optional[float], Optional[float]] = (None, None)
 
-    # Reward-maintained utility signals.
     profile_score: float = 0.5
     utility_score: float = 0.5
     freshness_score: float = 0.5
     coherence_score: float = 0.5
+    discovery_score: float = 0.0
     access_count: int = 0
     hit_count: int = 0
     failure_count: int = 0
     status: str = "active"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def score(self, query: str, now: Optional[float] = None) -> float:
-        """Score edge for profile fast-channel retrieval."""
+    def score(self, query: str, min_relevance: float = 0.015) -> float:
+        """Score edge for profile fast-channel retrieval with a relevance gate."""
         if self.status != "active":
             return 0.0
         text_score = keyword_overlap(query, self.summary) * 0.55
         kw_score = keyword_overlap(query, self.keywords) * 0.25
-        utility = self.utility_score * 0.12
-        profile = self.profile_score * 0.05
+        relevance = text_score + kw_score
+        # Utility should amplify relevant memories, not retrieve unrelated ones.
+        if relevance < min_relevance:
+            return 0.0
+        utility = self.utility_score * 0.10
+        profile = self.profile_score * 0.04
         freshness = self.freshness_score * 0.03
-        return clamp(text_score + kw_score + utility + profile + freshness)
+        discovery = self.discovery_score * 0.03
+        return clamp(relevance + utility + profile + freshness + discovery)
 
     def apply_feedback(self, hit: bool, answer_quality: float = 1.0, lr: float = 0.15) -> None:
         """Reward update: useful edges are promoted; noisy edges decay softly."""
-        self.access_count += 1
         if hit:
             self.hit_count += 1
             target = clamp(0.6 + 0.4 * answer_quality)
@@ -154,18 +177,33 @@ class RetrievalResult:
 
 class UserProfileHyperedgePool:
     """
-    Reward-guided profile hyperedge pool.
+    Semi-automatic reward-guided profile hyperedge pool.
 
     The pool is a fast personalized channel.  It should not replace the full
     memory base.  When evidence is insufficient, callers should fallback to the
     original HyperMem path or global fact retrieval.
     """
 
-    def __init__(self, user_id: str = "default_user") -> None:
+    def __init__(
+        self,
+        user_id: str = "default_user",
+        profile_typing_mode: str | ProfileTypingMode = ProfileTypingMode.HYBRID,
+        rule_confidence_threshold: float = 0.55,
+        discovery_threshold: float = 0.08,
+        discovery_min_cluster_size: int = 2,
+        auto_discover_every: int = 1,
+    ) -> None:
         self.user_id = user_id
+        self.profile_typing_mode = ProfileTypingMode(profile_typing_mode)
+        self.rule_confidence_threshold = rule_confidence_threshold
+        self.discovery_threshold = discovery_threshold
+        self.discovery_min_cluster_size = discovery_min_cluster_size
+        self.auto_discover_every = max(1, auto_discover_every)
         self.nodes: Dict[str, MemoryNode] = {}
         self.edges: Dict[str, ProfileHyperedge] = {}
+        self.discovery_buffer: List[str] = []
         self._edge_counter = 0
+        self._ingest_counter = 0
 
     # ---------------------------- ingestion ----------------------------
     def add_node(self, node: MemoryNode) -> None:
@@ -189,7 +227,7 @@ class UserProfileHyperedgePool:
             node_type=NodeType.FACT,
             content=content,
             keywords=kw,
-            timestamp=timestamp or time.time(),
+            timestamp=timestamp if timestamp is not None else time.time(),
             topic_id=topic_id,
             episode_ids=episode_ids or [],
             metadata=metadata or {},
@@ -199,9 +237,46 @@ class UserProfileHyperedgePool:
             self.promote_node(node)
         return node
 
-    def promote_node(self, node: MemoryNode) -> ProfileHyperedge:
-        """Create or attach node to the best profile hyperedge."""
-        edge_type = self.classify_profile_type(node.content)
+    def promote_node(self, node: MemoryNode) -> Optional[ProfileHyperedge]:
+        """
+        Promote a node into the profile pool.
+
+        rule mode:
+            always uses seed profile types.
+        unsupervised mode:
+            sends every node to the discovery buffer.
+        hybrid mode:
+            uses seed types only when rule confidence is high; otherwise
+            sends the node to unsupervised discovery.
+        """
+        self._ingest_counter += 1
+        if self.profile_typing_mode == ProfileTypingMode.UNSUPERVISED:
+            edge = self._try_attach_to_auto_edge(node)
+            if edge:
+                return edge
+            self._add_to_discovery_buffer(node.node_id)
+            self._maybe_run_discovery()
+            return None
+
+        edge_type, confidence, matched = self.infer_profile_type(node.content)
+        if self.profile_typing_mode == ProfileTypingMode.RULE or confidence >= self.rule_confidence_threshold:
+            return self._attach_or_create_typed_edge(node, edge_type, confidence, matched)
+
+        # hybrid low-confidence path: discover new open-ended profile dimensions.
+        edge = self._try_attach_to_auto_edge(node)
+        if edge:
+            return edge
+        self._add_to_discovery_buffer(node.node_id)
+        self._maybe_run_discovery()
+        return None
+
+    def _attach_or_create_typed_edge(
+        self,
+        node: MemoryNode,
+        edge_type: ProfileHyperedgeType,
+        confidence: float,
+        matched_rules: Sequence[str],
+    ) -> ProfileHyperedge:
         candidates = [e for e in self.edges.values() if e.edge_type == edge_type and e.status == "active"]
         best: Optional[ProfileHyperedge] = None
         best_score = 0.0
@@ -209,10 +284,73 @@ class UserProfileHyperedgePool:
             s = max(keyword_overlap(node.content, edge.summary), keyword_overlap(node.keywords, edge.keywords))
             if s > best_score:
                 best_score, best = s, edge
-        if best is not None and best_score >= 0.08:
+        if best is not None and best_score >= self.discovery_threshold:
             self.attach_node(best.edge_id, node.node_id)
+            best.metadata.setdefault("rule_matches", [])
+            best.metadata["rule_matches"] = sorted(set(best.metadata["rule_matches"]) | set(matched_rules))
             return best
-        return self.create_edge(edge_type, [node.node_id], summary=self._edge_summary(edge_type, [node]))
+        return self.create_edge(
+            edge_type,
+            [node.node_id],
+            summary=self._edge_summary(edge_type, [node]),
+            metadata={"source": "rule_seed", "rule_confidence": confidence, "rule_matches": list(matched_rules)},
+        )
+
+    def _try_attach_to_auto_edge(self, node: MemoryNode) -> Optional[ProfileHyperedge]:
+        auto_edges = [e for e in self.edges.values() if e.edge_type == ProfileHyperedgeType.AUTO_DISCOVERED and e.status == "active"]
+        best: Optional[ProfileHyperedge] = None
+        best_score = 0.0
+        for edge in auto_edges:
+            s = max(keyword_overlap(node.content, edge.summary), keyword_overlap(node.keywords, edge.keywords))
+            if s > best_score:
+                best_score, best = s, edge
+        if best is not None and best_score >= self.discovery_threshold:
+            self.attach_node(best.edge_id, node.node_id)
+            best.discovery_score = clamp(best.discovery_score + 0.05)
+            return best
+        return None
+
+    def _add_to_discovery_buffer(self, node_id: str) -> None:
+        if node_id not in self.discovery_buffer:
+            self.discovery_buffer.append(node_id)
+
+    def _maybe_run_discovery(self) -> None:
+        if self._ingest_counter % self.auto_discover_every == 0:
+            self.discover_profile_hyperedges()
+
+    def discover_profile_hyperedges(self) -> List[ProfileHyperedge]:
+        """Greedy unsupervised clustering over low-confidence memory nodes."""
+        created: List[ProfileHyperedge] = []
+        remaining = [nid for nid in self.discovery_buffer if nid in self.nodes]
+        used: set[str] = set()
+
+        for seed_id in remaining:
+            if seed_id in used:
+                continue
+            seed = self.nodes[seed_id]
+            cluster = [seed_id]
+            for other_id in remaining:
+                if other_id == seed_id or other_id in used:
+                    continue
+                other = self.nodes[other_id]
+                sim = max(keyword_overlap(seed.text(), other.text()), keyword_overlap(seed.keywords, other.keywords))
+                if sim >= self.discovery_threshold:
+                    cluster.append(other_id)
+            if len(cluster) >= self.discovery_min_cluster_size:
+                nodes = [self.nodes[nid] for nid in cluster]
+                avg_sim = self._avg_pairwise_similarity(nodes)
+                edge = self.create_edge(
+                    ProfileHyperedgeType.AUTO_DISCOVERED,
+                    cluster,
+                    summary=self._edge_summary(ProfileHyperedgeType.AUTO_DISCOVERED, nodes),
+                    metadata={"source": "unsupervised_discovery", "cluster_size": len(cluster), "avg_similarity": avg_sim},
+                )
+                edge.discovery_score = clamp(0.5 + avg_sim)
+                created.append(edge)
+                used.update(cluster)
+
+        self.discovery_buffer = [nid for nid in remaining if nid not in used]
+        return created
 
     def create_edge(
         self,
@@ -238,6 +376,7 @@ class UserProfileHyperedgePool:
             utility_score=0.55,
             freshness_score=0.7,
             coherence_score=self._coherence(member_nodes),
+            discovery_score=0.6 if edge_type == ProfileHyperedgeType.AUTO_DISCOVERED else 0.0,
             metadata=metadata or {},
         )
         self.edges[edge_id] = edge
@@ -250,7 +389,7 @@ class UserProfileHyperedgePool:
         node = self.nodes[node_id]
         edge.summary = self._edge_summary(edge.edge_type, [self.nodes[n] for n in edge.member_node_ids if n in self.nodes])
         edge.keywords = self._extract_keywords(edge.summary + " " + " ".join(node.keywords))
-        ts = [self.nodes[n].timestamp for n in edge.member_node_ids if n in self.nodes and self.nodes[n].timestamp]
+        ts = [self.nodes[n].timestamp for n in edge.member_node_ids if n in self.nodes and self.nodes[n].timestamp is not None]
         edge.time_span = (min(ts) if ts else None, max(ts) if ts else None)
         edge.coherence_score = self._coherence([self.nodes[n] for n in edge.member_node_ids if n in self.nodes])
         edge.freshness_score = clamp(edge.freshness_score + 0.08)
@@ -304,37 +443,54 @@ class UserProfileHyperedgePool:
             if edge_id in self.edges:
                 self.edges[edge_id].apply_feedback(hit=hit, answer_quality=answer_quality)
 
-    # ---------------------------- profile helpers ----------------------------
+    # ---------------------------- profile typing ----------------------------
     def classify_profile_type(self, text: str) -> ProfileHyperedgeType:
-        t = (text or "").lower()
-        if any(x in t for x in ["喜欢", "偏好", "希望", "习惯", "prefer", "style", "usually", "常常"]):
-            return ProfileHyperedgeType.PREFERENCE
-        if any(x in t for x in ["目标", "投稿", "aaai", "acl", "goal", "aim", "target"]):
-            return ProfileHyperedgeType.GOAL
-        if any(x in t for x in ["流程", "workflow", "codex", "prompt", "跑实验", "实验结果"]):
-            return ProfileHyperedgeType.HABIT
-        if any(x in t for x in ["当前", "现在", "最终", "latest", "current", "finally", "决定"]):
-            return ProfileHyperedgeType.CURRENT_STATE
-        if any(x in t for x in ["后来", "之前", "变化", "演化", "earlier", "later", "evolve", "change"]):
-            return ProfileHyperedgeType.TEMPORAL_EVOLUTION
-        if any(x in t for x in ["hypermem", "memory", "locomo", "超图", "超边", "强化学习", "retrieval", "rag"]):
-            return ProfileHyperedgeType.DOMAIN_KNOWLEDGE
-        return ProfileHyperedgeType.OTHER
+        """Backward-compatible API: returns only the seed type."""
+        edge_type, _, _ = self.infer_profile_type(text)
+        return edge_type
 
-    def build_from_texts(self, texts: Iterable[str], user_id: Optional[str] = None) -> None:
+    def infer_profile_type(self, text: str) -> Tuple[ProfileHyperedgeType, float, List[str]]:
+        """Return seed type, confidence and matched rules for rule/hybrid modes."""
+        t = (text or "").lower()
+        rule_bank: List[Tuple[ProfileHyperedgeType, List[str]]] = [
+            (ProfileHyperedgeType.PREFERENCE, ["喜欢", "偏好", "希望", "习惯", "prefer", "style", "usually", "常常", "不喜欢"]),
+            (ProfileHyperedgeType.GOAL, ["目标", "投稿", "aaai", "acl", "goal", "aim", "target", "竞争力"]),
+            (ProfileHyperedgeType.HABIT, ["流程", "workflow", "codex", "prompt", "跑实验", "实验结果", "复现", "服务器"]),
+            (ProfileHyperedgeType.CURRENT_STATE, ["当前", "现在", "最终", "最新", "latest", "current", "finally", "决定", "主线"]),
+            (ProfileHyperedgeType.TEMPORAL_EVOLUTION, ["后来", "之前", "变化", "演化", "早期", "转向", "earlier", "later", "evolve", "change"]),
+            (ProfileHyperedgeType.DOMAIN_KNOWLEDGE, ["hypermem", "memory", "locomo", "超图", "超边", "强化学习", "retrieval", "rag", "画像"]),
+        ]
+        best_type = ProfileHyperedgeType.OTHER
+        best_matches: List[str] = []
+        for edge_type, keywords in rule_bank:
+            matches = [kw for kw in keywords if kw.lower() in t]
+            if len(matches) > len(best_matches):
+                best_type = edge_type
+                best_matches = matches
+        if not best_matches:
+            return ProfileHyperedgeType.OTHER, 0.0, []
+        # More matched rules means higher confidence, capped to avoid overclaiming.
+        confidence = clamp(0.35 + 0.16 * len(best_matches), hi=0.95)
+        return best_type, confidence, best_matches
+
+    def build_from_texts(self, texts: Iterable[str], user_id: Optional[str] = None, run_final_discovery: bool = True) -> None:
         if user_id:
             self.user_id = user_id
         for i, text in enumerate(texts):
             cleaned = str(text).strip()
             if cleaned:
                 self.add_fact(cleaned, node_id=f"fact_{i + 1:05d}", timestamp=float(i + 1))
+        if run_final_discovery:
+            self.discover_profile_hyperedges()
 
     def export_profile(self) -> Dict[str, Any]:
         return {
             "user_id": self.user_id,
+            "profile_typing_mode": self.profile_typing_mode.value,
             "num_nodes": len(self.nodes),
             "num_edges": len(self.edges),
             "active_edges": sum(1 for e in self.edges.values() if e.status == "active"),
+            "discovery_buffer_size": len(self.discovery_buffer),
             "edge_type_counts": self.edge_type_counts(),
             "top_edges": [
                 {
@@ -343,9 +499,10 @@ class UserProfileHyperedgePool:
                     "summary": e.summary,
                     "utility_score": round(e.utility_score, 4),
                     "profile_score": round(e.profile_score, 4),
+                    "discovery_score": round(e.discovery_score, 4),
                     "members": e.member_node_ids,
                 }
-                for e in sorted(self.edges.values(), key=lambda x: x.utility_score, reverse=True)[:10]
+                for e in sorted(self.edges.values(), key=lambda x: x.utility_score + x.discovery_score, reverse=True)[:10]
             ],
         }
 
@@ -359,7 +516,14 @@ class UserProfileHyperedgePool:
     def save(self, path: str | Path) -> None:
         data = {
             "user_id": self.user_id,
+            "profile_typing_mode": self.profile_typing_mode.value,
+            "rule_confidence_threshold": self.rule_confidence_threshold,
+            "discovery_threshold": self.discovery_threshold,
+            "discovery_min_cluster_size": self.discovery_min_cluster_size,
+            "auto_discover_every": self.auto_discover_every,
             "edge_counter": self._edge_counter,
+            "ingest_counter": self._ingest_counter,
+            "discovery_buffer": self.discovery_buffer,
             "nodes": {k: self._jsonify(asdict(v)) for k, v in self.nodes.items()},
             "edges": {k: self._jsonify(asdict(v)) for k, v in self.edges.items()},
         }
@@ -369,8 +533,17 @@ class UserProfileHyperedgePool:
     @classmethod
     def load(cls, path: str | Path) -> "UserProfileHyperedgePool":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        pool = cls(user_id=data.get("user_id", "default_user"))
+        pool = cls(
+            user_id=data.get("user_id", "default_user"),
+            profile_typing_mode=data.get("profile_typing_mode", ProfileTypingMode.HYBRID.value),
+            rule_confidence_threshold=float(data.get("rule_confidence_threshold", 0.55)),
+            discovery_threshold=float(data.get("discovery_threshold", 0.08)),
+            discovery_min_cluster_size=int(data.get("discovery_min_cluster_size", 2)),
+            auto_discover_every=int(data.get("auto_discover_every", 1)),
+        )
         pool._edge_counter = int(data.get("edge_counter", 0))
+        pool._ingest_counter = int(data.get("ingest_counter", 0))
+        pool.discovery_buffer = list(data.get("discovery_buffer", []))
         for node_id, raw in data.get("nodes", {}).items():
             raw["node_type"] = NodeType(raw["node_type"])
             pool.nodes[node_id] = MemoryNode(**raw)
@@ -430,16 +603,23 @@ class UserProfileHyperedgePool:
             return 0.75
         if edge_type in {ProfileHyperedgeType.HABIT, ProfileHyperedgeType.DOMAIN_KNOWLEDGE, ProfileHyperedgeType.TEMPORAL_EVOLUTION}:
             return 0.65
+        if edge_type == ProfileHyperedgeType.AUTO_DISCOVERED:
+            return 0.55
         return 0.45
 
     def _coherence(self, nodes: Sequence[MemoryNode]) -> float:
         if len(nodes) <= 1:
             return 0.8
+        return clamp(self._avg_pairwise_similarity(nodes) + 0.35)
+
+    def _avg_pairwise_similarity(self, nodes: Sequence[MemoryNode]) -> float:
+        if len(nodes) <= 1:
+            return 0.0
         vals = []
         for i in range(len(nodes)):
             for j in range(i + 1, len(nodes)):
                 vals.append(keyword_overlap(nodes[i].text(), nodes[j].text()))
-        return clamp(sum(vals) / max(1, len(vals)) + 0.35)
+        return sum(vals) / max(1, len(vals))
 
     def _jsonify(self, obj: Any) -> Any:
         if isinstance(obj, Enum):
