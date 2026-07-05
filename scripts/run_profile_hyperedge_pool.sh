@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the user-profile guided hyperedge pool demo and retrieval-only eval.
+# Run the semi-automatic user-profile hyperedge pool demo and retrieval-only eval.
 # This script does not call OpenAI / DeepSeek / LLM judge and does not run stage 5/6.
 
-OUT_DIR=${1:-outputs/profile_eval}
+OUT_ROOT=${1:-outputs/profile_eval}
 
-echo "[1/2] Running profile hyperedge pool demo..."
+echo "[1/4] Running semi-automatic profile hyperedge pool demo..."
 python examples/user_profile_hyperedge_demo.py
 
-echo "[2/2] Running profile hyperedge pool retrieval-only eval..."
-python examples/profile_hyperedge_pool_eval.py --output-dir "${OUT_DIR}"
+echo "[2/4] Running rule profile typing eval..."
+python examples/profile_hyperedge_pool_eval.py \
+  --profile-typing-mode rule \
+  --output-dir "${OUT_ROOT}/rule"
 
-echo "Done. Outputs written to ${OUT_DIR}"
+echo "[3/4] Running unsupervised profile discovery eval..."
+python examples/profile_hyperedge_pool_eval.py \
+  --profile-typing-mode unsupervised \
+  --output-dir "${OUT_ROOT}/unsupervised"
+
+echo "[4/4] Running hybrid profile discovery eval..."
+python examples/profile_hyperedge_pool_eval.py \
+  --profile-typing-mode hybrid \
+  --output-dir "${OUT_ROOT}/hybrid"
+
+echo "Done. Outputs written under ${OUT_ROOT}"
