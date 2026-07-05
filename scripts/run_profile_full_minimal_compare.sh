@@ -10,7 +10,7 @@ set -euo pipefail
 # It runs on FULL converted data, not a subset.
 #
 # Configurations:
-#   1. global_fact_retrieval: HyperMem-style/global fact retrieval proxy
+#   1. global_fact_retrieval: HyperMem-style/global retrieval proxy
 #   2. hybrid_profile_pool : proposed user-profile-guided hyperedge pool
 #
 # Outputs:
@@ -35,41 +35,58 @@ mkdir -p "${OUT_ROOT}/logs" "${OUT_ROOT}/data"
 LOG_FILE="${OUT_ROOT}/logs/full_minimal_compare_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
-echo "=============================================================================="
-echo "UP-HyperPool Full-data Minimal Comparison"
-echo "=============================================================================="
-echo "source_dir  : ${SOURCE_DIR}"
-echo "out_root    : ${OUT_ROOT}"
-echo "threshold   : ${THRESHOLD}"
-echo "max_tokens  : ${MAX_TOKENS}"
-echo "global_top_k: ${GLOBAL_TOP_K}"
-echo "started_at  : $(date '+%Y-%m-%d %H:%M:%S')"
-echo "git_commit  : $(git rev-parse HEAD 2>/dev/null || echo unknown)"
-echo "python      : $(python --version)"
-echo "=============================================================================="
+STAGE_START=0
+PIPELINE_START=$(date +%s)
 
-python -m py_compile hypermem/profile_hyperedge_pool.py
-python -m py_compile examples/profile_hyperedge_pool_eval.py
-python -m py_compile examples/global_fact_retrieval_eval.py
-python -m py_compile examples/prepare_profile_eval_data.py
+progress_bar() {
+  local current=$1
+  local total=$2
+  local label=$3
+  local width=28
+  local filled=$(( current * width / total ))
+  local empty=$(( width - filled ))
+  local bar=""
+  local i
+  for ((i=0; i<filled; i++)); do bar+="#"; done
+  for ((i=0; i<empty; i++)); do bar+="-"; done
+  printf '\n[%s] [%s] %s/%s\n' "${label}" "${bar}" "${current}" "${total}"
+}
 
-if [[ ! -d "${SOURCE_DIR}" ]]; then
-  echo "ERROR: source directory not found: ${SOURCE_DIR}" >&2
-  exit 2
-fi
+stage_begin() {
+  local idx=$1
+  local total=$2
+  local msg=$3
+  STAGE_START=$(date +%s)
+  echo ""
+  echo "=============================================================================="
+  progress_bar "${idx}" "${total}" "stage"
+  echo "START stage ${idx}/${total}: ${msg}"
+  echo "started_at: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "=============================================================================="
+}
 
-echo "[1/4] Preparing FULL converted data"
-python examples/prepare_profile_eval_data.py \
-  --source-dir "${SOURCE_DIR}" \
-  --out-dir "${OUT_ROOT}/data" \
-  --max-memory 1000000 \
-  --max-questions 1000000
+stage_end() {
+  local idx=$1
+  local total=$2
+  local msg=$3
+  local now elapsed
+  now=$(date +%s)
+  elapsed=$(( now - STAGE_START ))
+  progress_bar "${idx}" "${total}" "done "
+  echo "DONE stage ${idx}/${total}: ${msg} | elapsed=${elapsed}s"
+}
 
-MEMORY_JSON="${OUT_ROOT}/data/locomo_memory_facts.jsonl"
-QUESTIONS_JSON="${OUT_ROOT}/data/locomo_questions.jsonl"
-MEMORY_N=$(wc -l < "${MEMORY_JSON}" | tr -d ' ')
-QUESTION_N=$(wc -l < "${QUESTIONS_JSON}" | tr -d ' ')
+run_stage() {
+  local idx=$1
+  local total=$2
+  local msg=$3
+  shift 3
+  stage_begin "${idx}" "${total}" "${msg}"
+  "$@"
+  stage_end "${idx}" "${total}" "${msg}"
+}
 
+write_data_report() {
 python - <<PY
 import json
 from pathlib import Path
@@ -88,31 +105,9 @@ out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8
 print("wrote", out)
 print(json.dumps(report, ensure_ascii=False, indent=2))
 PY
+}
 
-if [[ "${MEMORY_N}" -eq 0 || "${QUESTION_N}" -eq 0 ]]; then
-  echo "ERROR: no usable full data extracted." >&2
-  echo "Inspect ${OUT_ROOT}/data/profile_eval_data_report.json" >&2
-  exit 3
-fi
-
-echo "[2/4] Running HyperMem-style/global fact retrieval baseline on FULL data"
-python examples/global_fact_retrieval_eval.py \
-  --memory-json "${MEMORY_JSON}" \
-  --questions-json "${QUESTIONS_JSON}" \
-  --max-tokens "${MAX_TOKENS}" \
-  --top-k "${GLOBAL_TOP_K}" \
-  --output-dir "${OUT_ROOT}/global_fact_retrieval"
-
-echo "[3/4] Running proposed hybrid profile hyperedge pool on FULL data"
-python examples/profile_hyperedge_pool_eval.py \
-  --memory-json "${MEMORY_JSON}" \
-  --questions-json "${QUESTIONS_JSON}" \
-  --profile-typing-mode hybrid \
-  --sufficiency-threshold "${THRESHOLD}" \
-  --max-tokens "${MAX_TOKENS}" \
-  --output-dir "${OUT_ROOT}/hybrid_profile_pool"
-
-echo "[4/4] Writing comparison summary"
+write_compare_summary() {
 python - <<PY
 import csv, json
 from pathlib import Path
@@ -157,9 +152,80 @@ with (root / "full_minimal_compare_summary.csv").open("w", encoding="utf-8", new
 print("wrote", root / "full_minimal_compare_summary.csv")
 print("wrote", root / "full_minimal_compare_summary.json")
 PY
+}
+
+echo "=============================================================================="
+echo "UP-HyperPool Full-data Minimal Comparison"
+echo "=============================================================================="
+echo "source_dir  : ${SOURCE_DIR}"
+echo "out_root    : ${OUT_ROOT}"
+echo "threshold   : ${THRESHOLD}"
+echo "max_tokens  : ${MAX_TOKENS}"
+echo "global_top_k: ${GLOBAL_TOP_K}"
+echo "started_at  : $(date '+%Y-%m-%d %H:%M:%S')"
+echo "git_commit  : $(git rev-parse HEAD 2>/dev/null || echo unknown)"
+echo "python      : $(python --version)"
+echo "=============================================================================="
+
+python -m py_compile hypermem/profile_hyperedge_pool.py
+python -m py_compile examples/profile_hyperedge_pool_eval.py
+python -m py_compile examples/global_fact_retrieval_eval.py
+python -m py_compile examples/prepare_profile_eval_data.py
+
+if [[ ! -d "${SOURCE_DIR}" ]]; then
+  echo "ERROR: source directory not found: ${SOURCE_DIR}" >&2
+  exit 2
+fi
+
+TOTAL_STAGES=4
+
+stage_begin 1 "${TOTAL_STAGES}" "Preparing FULL converted data"
+python examples/prepare_profile_eval_data.py \
+  --source-dir "${SOURCE_DIR}" \
+  --out-dir "${OUT_ROOT}/data" \
+  --max-memory 1000000 \
+  --max-questions 1000000
+
+MEMORY_JSON="${OUT_ROOT}/data/locomo_memory_facts.jsonl"
+QUESTIONS_JSON="${OUT_ROOT}/data/locomo_questions.jsonl"
+MEMORY_N=$(wc -l < "${MEMORY_JSON}" | tr -d ' ')
+QUESTION_N=$(wc -l < "${QUESTIONS_JSON}" | tr -d ' ')
+write_data_report
+
+if [[ "${MEMORY_N}" -eq 0 || "${QUESTION_N}" -eq 0 ]]; then
+  echo "ERROR: no usable full data extracted." >&2
+  echo "Inspect ${OUT_ROOT}/data/profile_eval_data_report.json" >&2
+  exit 3
+fi
+stage_end 1 "${TOTAL_STAGES}" "Preparing FULL converted data"
+
+run_stage 2 "${TOTAL_STAGES}" "Running HyperMem-style/global fact retrieval baseline on FULL data" \
+  python examples/global_fact_retrieval_eval.py \
+    --memory-json "${MEMORY_JSON}" \
+    --questions-json "${QUESTIONS_JSON}" \
+    --max-tokens "${MAX_TOKENS}" \
+    --top-k "${GLOBAL_TOP_K}" \
+    --output-dir "${OUT_ROOT}/global_fact_retrieval"
+
+run_stage 3 "${TOTAL_STAGES}" "Running proposed hybrid profile hyperedge pool on FULL data" \
+  python examples/profile_hyperedge_pool_eval.py \
+    --memory-json "${MEMORY_JSON}" \
+    --questions-json "${QUESTIONS_JSON}" \
+    --profile-typing-mode hybrid \
+    --sufficiency-threshold "${THRESHOLD}" \
+    --max-tokens "${MAX_TOKENS}" \
+    --output-dir "${OUT_ROOT}/hybrid_profile_pool"
+
+stage_begin 4 "${TOTAL_STAGES}" "Writing comparison summary"
+write_compare_summary
+stage_end 4 "${TOTAL_STAGES}" "Writing comparison summary"
+
+PIPELINE_END=$(date +%s)
+PIPELINE_ELAPSED=$(( PIPELINE_END - PIPELINE_START ))
 
 echo "=============================================================================="
 echo "Finished at: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Total elapsed: ${PIPELINE_ELAPSED}s"
 echo "Log file    : ${LOG_FILE}"
 echo "Data report : ${OUT_ROOT}/data_report.json"
 echo "Summary CSV : ${OUT_ROOT}/full_minimal_compare_summary.csv"
