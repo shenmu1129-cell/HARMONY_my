@@ -1,9 +1,10 @@
-"""Demo for the user-profile guided hyperedge pool fast channel.
+"""Demo for semi-automatic user-profile hyperedge discovery.
 
 Run:
     python examples/user_profile_hyperedge_demo.py
 
-This demo is intentionally retrieval-only and does not call any LLM service.
+This demo is retrieval-only and does not call any LLM service.
+It compares rule / unsupervised / hybrid profile typing modes.
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ DEMO_FACTS = [
     "如果用户画像超边池证据不足，系统应该 fallback 到原始 HyperMem topic-episode-fact 路径或 global fact retrieval。",
     "强化学习或 reward regression 可以用于提升超边 utility，命中奖励更高，错误或过期画像会被降权。",
     "时间处理是长期记忆的重要创新点，需要区分 earlier、later、current state 和 temporal evolution。",
+    "用户经常让助手检查 GitHub、更新 README、写 Codex prompt、给出服务器运行命令。",
+    "用户反复关注实验结果是否能支撑 AAAI 创新，而不是只做工程模块拼接。",
 ]
 
 
@@ -39,34 +42,54 @@ QUERIES = [
     "如果画像超边池没找到证据怎么办？",
     "为什么 dynamic-only 不是最终主线？",
     "强化学习在这个超边池里起什么作用？",
+    "我经常让你帮我做哪些工程操作？",
 ]
 
 
-def main() -> None:
-    pool = UserProfileHyperedgePool(user_id="demo_user")
+def build_pool(mode: str) -> UserProfileHyperedgePool:
+    pool = UserProfileHyperedgePool(
+        user_id="demo_user",
+        profile_typing_mode=mode,
+        rule_confidence_threshold=0.55,
+        discovery_threshold=0.08,
+        discovery_min_cluster_size=2,
+        auto_discover_every=1,
+    )
     pool.build_from_texts(DEMO_FACTS, user_id="demo_user")
+    return pool
 
-    print("=== User-Profile Hyperedge Pool ===")
+
+def show_pool(mode: str) -> None:
+    pool = build_pool(mode)
     profile = pool.export_profile()
+    print("\n" + "#" * 90)
+    print(f"Profile typing mode: {mode}")
     print("edge_type_counts:", profile["edge_type_counts"])
-    print("num_edges:", profile["num_edges"])
-    print()
+    print("num_edges:", profile["num_edges"], "discovery_buffer_size:", profile["discovery_buffer_size"])
 
     for query in QUERIES:
-        result = pool.retrieve_fast_channel(query, top_k_edges=3, max_tokens=120)
-        print("=" * 80)
+        result = pool.retrieve_fast_channel(query, top_k_edges=3, max_tokens=140, fallback_nodes=list(pool.nodes.values()))
+        print("=" * 90)
         print("Query:", query)
         print("Channel:", result.channel)
         print("Score:", round(result.score, 4), "Tokens:", result.tokens, "Sufficient:", result.sufficient)
         print("Matched hyperedges:")
         for edge in result.hyperedges:
-            print(f"  - {edge.edge_id} [{edge.edge_type.value}] utility={edge.utility_score:.2f}: {edge.summary}")
+            print(
+                f"  - {edge.edge_id} [{edge.edge_type.value}] "
+                f"utility={edge.utility_score:.2f} discovery={edge.discovery_score:.2f}: {edge.summary}"
+            )
         print("Evidence:")
         print(result.evidence_text())
 
-    out_path = ROOT / "outputs" / "profile_hyperedge_demo_pool.json"
+    out_path = ROOT / "outputs" / f"profile_hyperedge_demo_pool_{mode}.json"
     pool.save(out_path)
-    print("\nSaved demo pool to", out_path)
+    print("Saved demo pool to", out_path)
+
+
+def main() -> None:
+    for mode in ["rule", "unsupervised", "hybrid"]:
+        show_pool(mode)
 
 
 if __name__ == "__main__":
