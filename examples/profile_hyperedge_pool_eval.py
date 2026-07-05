@@ -6,6 +6,11 @@ It does not call OpenAI, DeepSeek, stage 5/6, or any LLM judge.
 Built-in demo:
     python examples/profile_hyperedge_pool_eval.py --output-dir outputs/profile_eval
 
+Compare profile discovery modes:
+    python examples/profile_hyperedge_pool_eval.py --profile-typing-mode rule --output-dir outputs/profile_rule
+    python examples/profile_hyperedge_pool_eval.py --profile-typing-mode unsupervised --output-dir outputs/profile_unsup
+    python examples/profile_hyperedge_pool_eval.py --profile-typing-mode hybrid --output-dir outputs/profile_hybrid
+
 Custom data:
     python examples/profile_hyperedge_pool_eval.py \
       --memory-json data/memory_facts.jsonl \
@@ -26,13 +31,13 @@ import csv
 import json
 from pathlib import Path
 import sys
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hypermem.profile_hyperedge_pool import MemoryNode, NodeType, UserProfileHyperedgePool, keyword_overlap
+from hypermem.profile_hyperedge_pool import MemoryNode, UserProfileHyperedgePool, keyword_overlap
 
 
 DEMO_MEMORY = [
@@ -48,6 +53,8 @@ DEMO_MEMORY = [
     "当 profile fast channel 证据不足时，系统应 fallback 到原始 HyperMem path 或 global fact retrieval。",
     "奖励更新用于维护 profile hyperedge utility：命中和帮助回答则升权，错误、过期或无贡献则降权。",
     "时间处理可以成为创新点，因为长期记忆需要区分过去想法、最新状态和想法演化链。",
+    "用户经常讨论代码实现、服务器运行、GitHub main 分支、README 和 Codex 生成代码。",
+    "用户也会讨论论文投稿、审稿人意见、AAAI 竞争力、实验是否足够支撑创新。",
 ]
 
 DEMO_QUESTIONS = [
@@ -56,6 +63,7 @@ DEMO_QUESTIONS = [
     {"question": "为什么 adaptive_controller_v1 还不行？", "gold": ["规则版", "引入噪声"], "category": "experiment"},
     {"question": "如果快速通道证据不足怎么办？", "gold": ["fallback", "原始 HyperMem"], "category": "method"},
     {"question": "强化学习奖励在超边池里干什么？", "gold": ["utility", "升权", "降权"], "category": "rl"},
+    {"question": "我经常让你帮我做哪些工程操作？", "gold": ["服务器运行", "GitHub", "Codex"], "category": "auto_discovery"},
 ]
 
 
@@ -146,8 +154,15 @@ def reward(hit: int, recall: float, tokens: int, fallback_used: bool) -> float:
     return recall + 0.2 * hit - 0.1 * tokens / 1000.0 - (0.03 if fallback_used else 0.0)
 
 
-def build_pool(memory_rows: Sequence[Dict[str, Any]]) -> UserProfileHyperedgePool:
-    pool = UserProfileHyperedgePool(user_id="eval_user")
+def build_pool(memory_rows: Sequence[Dict[str, Any]], args: argparse.Namespace) -> UserProfileHyperedgePool:
+    pool = UserProfileHyperedgePool(
+        user_id="eval_user",
+        profile_typing_mode=args.profile_typing_mode,
+        rule_confidence_threshold=args.rule_confidence_threshold,
+        discovery_threshold=args.discovery_threshold,
+        discovery_min_cluster_size=args.discovery_min_cluster_size,
+        auto_discover_every=args.auto_discover_every,
+    )
     for row in normalize_memory(memory_rows):
         pool.add_fact(
             content=row["content"],
@@ -159,6 +174,7 @@ def build_pool(memory_rows: Sequence[Dict[str, Any]]) -> UserProfileHyperedgePoo
             metadata=row.get("metadata") or {},
             promote=True,
         )
+    pool.discover_profile_hyperedges()
     return pool
 
 
@@ -179,9 +195,10 @@ def run_eval(args: argparse.Namespace) -> None:
     else:
         question_rows = DEMO_QUESTIONS
 
-    pool = build_pool(memory_rows)
+    pool = build_pool(memory_rows, args)
     questions = normalize_questions(question_rows)
     fb_nodes = fallback_nodes(pool)
+    enable_fallback = not args.no_fallback
 
     trace_path = out_dir / "profile_hyperedge_pool_trace.jsonl"
     rows: List[Dict[str, Any]] = []
@@ -194,7 +211,7 @@ def run_eval(args: argparse.Namespace) -> None:
                 top_k_edges=args.top_k_edges,
                 max_tokens=args.max_tokens,
                 sufficiency_threshold=args.sufficiency_threshold,
-                fallback_nodes=fb_nodes if args.enable_fallback else None,
+                fallback_nodes=fb_nodes if enable_fallback else None,
             )
             ev_text = result.evidence_text()
             hit = evidence_hit(ev_text, q["gold"])
@@ -207,6 +224,7 @@ def run_eval(args: argparse.Namespace) -> None:
                 "qid": q["qid"],
                 "category": q["category"],
                 "question": q["question"],
+                "typing_mode": args.profile_typing_mode,
                 "channel": result.channel,
                 "hit": hit,
                 "recall": round(rec, 6),
@@ -231,6 +249,8 @@ def run_eval(args: argparse.Namespace) -> None:
                                 "summary": e.summary,
                                 "utility_score": e.utility_score,
                                 "profile_score": e.profile_score,
+                                "discovery_score": e.discovery_score,
+                                "metadata": e.metadata,
                             }
                             for e in result.hyperedges
                         ],
@@ -249,6 +269,16 @@ def run_eval(args: argparse.Namespace) -> None:
             writer.writerows(rows)
 
     summary = summarize(rows)
+    profile = pool.export_profile()
+    summary.update(
+        {
+            "typing_mode": args.profile_typing_mode,
+            "edge_type_counts": profile["edge_type_counts"],
+            "num_edges": profile["num_edges"],
+            "active_edges": profile["active_edges"],
+            "discovery_buffer_size": profile["discovery_buffer_size"],
+        }
+    )
     summary_path = out_dir / "profile_hyperedge_pool_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -294,7 +324,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k-edges", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=450)
     parser.add_argument("--sufficiency-threshold", type=float, default=0.18)
-    parser.add_argument("--enable-fallback", action="store_true", default=True)
+    parser.add_argument("--no-fallback", action="store_true", help="Disable fallback to base facts for ablation.")
+
+    parser.add_argument("--profile-typing-mode", choices=["rule", "unsupervised", "hybrid"], default="hybrid")
+    parser.add_argument("--rule-confidence-threshold", type=float, default=0.55)
+    parser.add_argument("--discovery-threshold", type=float, default=0.08)
+    parser.add_argument("--discovery-min-cluster-size", type=int, default=2)
+    parser.add_argument("--auto-discover-every", type=int, default=1)
     return parser.parse_args()
 
 
