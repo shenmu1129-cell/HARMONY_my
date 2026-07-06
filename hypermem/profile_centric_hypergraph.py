@@ -21,6 +21,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional at runtime.
+    tqdm = None  # type: ignore[assignment]
+
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
 
 
@@ -50,6 +55,12 @@ def keyword_overlap(a: str | Sequence[str], b: str | Sequence[str]) -> float:
     if not a_set or not b_set:
         return 0.0
     return len(a_set & b_set) / max(1, len(a_set | b_set))
+
+
+def _progress(iterable, *, total: Optional[int] = None, desc: str = "", enabled: bool = False):
+    if enabled and tqdm is not None:
+        return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True)
+    return iterable
 
 
 class HashedEmbeddingModel:
@@ -248,6 +259,9 @@ class ProfileCentricHypergraphMemory:
         self.discovery_buffer: List[str] = []
         self._edge_counter = 0
 
+    def active_edge_count(self) -> int:
+        return sum(1 for edge in self.edges.values() if edge.status == "active")
+
     def add_fact(
         self,
         content: str,
@@ -272,8 +286,16 @@ class ProfileCentricHypergraphMemory:
             self.promote_fact(fact)
         return fact
 
-    def build_from_rows(self, rows: Sequence[Dict[str, Any]]) -> None:
-        for i, row in enumerate(rows):
+    def build_from_rows(
+        self,
+        rows: Sequence[Dict[str, Any]],
+        show_progress: bool = False,
+        max_auto_edge_pairs: int = 0,
+    ) -> None:
+        started = time.time()
+        print(f"[build] start rows={len(rows)}", flush=True)
+        iterator = _progress(enumerate(rows), total=len(rows), desc="[build] add facts", enabled=show_progress)
+        for i, row in iterator:
             content = row.get("content") or row.get("text") or row.get("fact") or row.get("summary") or ""
             if not content:
                 continue
@@ -287,7 +309,23 @@ class ProfileCentricHypergraphMemory:
                 timestamp=float(row.get("timestamp") or row.get("time_index") or i + 1),
                 metadata=dict(row),
             )
-        self.discover_auto_edges()
+            if show_progress and tqdm is None and (i + 1) % 500 == 0:
+                print(
+                    f"[build] add facts {i + 1}/{len(rows)} facts={len(self.facts)} "
+                    f"edges={len(self.edges)} active={self.active_edge_count()}",
+                    flush=True,
+                )
+        print(
+            f"[build] facts added facts={len(self.facts)} edges={len(self.edges)} "
+            f"active_edges={self.active_edge_count()} elapsed={time.time() - started:.2f}s",
+            flush=True,
+        )
+        self.discover_auto_edges(show_progress=show_progress, max_pairs=max_auto_edge_pairs)
+        print(
+            f"[build] done facts={len(self.facts)} edges={len(self.edges)} "
+            f"active_edges={self.active_edge_count()} elapsed={time.time() - started:.2f}s",
+            flush=True,
+        )
 
     def promote_fact(self, fact: ProfileFact) -> ProfileHyperedgeUnit:
         edge_type, confidence, matched = self.infer_profile_type(fact.content)
@@ -333,26 +371,62 @@ class ProfileCentricHypergraphMemory:
         self.refresh_edge(best)
         return best
 
-    def discover_auto_edges(self) -> None:
+    def discover_auto_edges(self, show_progress: bool = False, max_pairs: int = 0) -> None:
+        started = time.time()
         active_auto = [edge for edge in self.edges.values() if edge.edge_type == ProfileEdgeType.AUTO_DISCOVERED and edge.status == "active"]
-        changed = True
-        while changed:
-            changed = False
-            for i, left in enumerate(list(active_auto)):
-                if left.status != "active":
-                    continue
-                for right in active_auto[i + 1 :]:
-                    if right.status != "active":
+        total_possible = len(active_auto) * max(0, len(active_auto) - 1) // 2
+        budget_text = "unlimited" if max_pairs <= 0 else str(max_pairs)
+        print(
+            f"[discover] start active_auto={len(active_auto)} possible_pairs={total_possible} max_pairs={budget_text}",
+            flush=True,
+        )
+        pair_count = 0
+        merge_count = 0
+        stopped_by_budget = False
+        progress_total = max_pairs if max_pairs > 0 else None
+        pbar = tqdm(total=progress_total, desc="[discover] auto pairs", dynamic_ncols=True) if show_progress and tqdm is not None else None
+        try:
+            changed = True
+            while changed:
+                changed = False
+                for i, left in enumerate(list(active_auto)):
+                    if left.status != "active":
                         continue
-                    sim = HashedEmbeddingModel.cosine(left.embedding, right.embedding)
-                    if sim >= self.discovery_threshold:
-                        for fid in right.member_fact_ids:
-                            if fid not in left.member_fact_ids:
-                                left.member_fact_ids.append(fid)
-                        right.status = "merged"
-                        self.refresh_edge(left)
-                        changed = True
-                active_auto = [edge for edge in active_auto if edge.status == "active"]
+                    for right in active_auto[i + 1 :]:
+                        if right.status != "active":
+                            continue
+                        if max_pairs > 0 and pair_count >= max_pairs:
+                            stopped_by_budget = True
+                            break
+                        pair_count += 1
+                        if pbar is not None:
+                            pbar.update(1)
+                        elif show_progress and pair_count % 100000 == 0:
+                            print(f"[discover] checked_pairs={pair_count} merges={merge_count}", flush=True)
+                        sim = HashedEmbeddingModel.cosine(left.embedding, right.embedding)
+                        if sim >= self.discovery_threshold:
+                            for fid in right.member_fact_ids:
+                                if fid not in left.member_fact_ids:
+                                    left.member_fact_ids.append(fid)
+                            right.status = "merged"
+                            self.refresh_edge(left)
+                            merge_count += 1
+                            changed = True
+                    if stopped_by_budget:
+                        break
+                    active_auto = [edge for edge in active_auto if edge.status == "active"]
+                if stopped_by_budget:
+                    break
+        finally:
+            if pbar is not None:
+                pbar.close()
+        active_after = [edge for edge in self.edges.values() if edge.edge_type == ProfileEdgeType.AUTO_DISCOVERED and edge.status == "active"]
+        print(
+            f"[discover] done checked_pairs={pair_count} merges={merge_count} "
+            f"active_auto_after={len(active_after)} stopped_by_budget={int(stopped_by_budget)} "
+            f"elapsed={time.time() - started:.2f}s",
+            flush=True,
+        )
 
     def create_edge(self, edge_type: ProfileEdgeType, member_fact_ids: List[str], summary: str, confidence: float = 0.50, metadata: Optional[Dict[str, Any]] = None) -> ProfileHyperedgeUnit:
         self._edge_counter += 1
