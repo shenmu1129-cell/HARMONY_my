@@ -1,8 +1,10 @@
 """Evaluate a saved graph as reward-guided behavioral-profile memory.
 
-Retrieval is still behavioral-hyperedge first: query -> profile hyperedges -> member facts.
-The router only decides whether selected behavioral edges should receive reward
-updates. Episodic/detail queries should not punish long-term behavioral edges.
+This script supports two retrieval modes:
+
+1. profile: query -> behavioral hyperedges -> member facts.
+2. dual_path: query -> behavioral hyperedges -> facts -> episodes, and
+   query -> topics -> episodes -> facts, followed by evidence alignment.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from hypermem.behavioral_profile import (  # noqa: E402
     update_behavioral_edges_from_feedback,
     write_behavioral_pool,
 )
+from hypermem.dual_path_retrieval import retrieve_dual_path  # noqa: E402
 from hypermem.profile_centric_hypergraph import ProfileCentricHypergraphMemory  # noqa: E402
 from hypermem.query_router import route_query, route_to_dict  # noqa: E402
 
@@ -43,6 +46,35 @@ def write_rows(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _retrieve(memory: ProfileCentricHypergraphMemory, question: str, args: argparse.Namespace, *, use_utility: bool, retrieval_mode: str):
+    if retrieval_mode == "dual_path":
+        return retrieve_dual_path(
+            memory,
+            question,
+            top_k_edges=args.top_k_edges,
+            top_k_facts=args.top_k_facts,
+            max_tokens=args.max_tokens,
+            use_utility=use_utility,
+            fallback=not args.no_fallback,
+            sufficiency_threshold=args.sufficiency_threshold,
+            top_k_topics=args.top_k_topics,
+            top_k_episodes=args.top_k_episodes,
+            profile_weight=args.dual_profile_weight,
+            topic_weight=args.dual_topic_weight,
+            episode_weight=args.dual_episode_weight,
+            alignment_weight=args.dual_alignment_weight,
+        )
+    return memory.retrieve(
+        question,
+        top_k_edges=args.top_k_edges,
+        top_k_facts=args.top_k_facts,
+        max_tokens=args.max_tokens,
+        use_utility=use_utility,
+        fallback=not args.no_fallback,
+        sufficiency_threshold=args.sufficiency_threshold,
+    )
+
+
 def run_behavioral_questions(
     memory: ProfileCentricHypergraphMemory,
     questions: Sequence[Dict[str, Any]],
@@ -51,6 +83,7 @@ def run_behavioral_questions(
     *,
     use_utility: bool,
     update: bool,
+    retrieval_mode: str,
     trace_file,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -58,20 +91,10 @@ def run_behavioral_questions(
     iterator = base_eval.progress(questions, total=len(questions), desc=f"[qa] {method}", enabled=not args.no_progress)
     for idx, q in enumerate(iterator, start=1):
         route = route_query(q["question"])
-        # Retrieval still uses behavioral hyperedges first; fallback acts as the
-        # detail/fact path when the selected hyperedges are insufficient.
-        result = memory.retrieve(
-            q["question"],
-            top_k_edges=args.top_k_edges,
-            top_k_facts=args.top_k_facts,
-            max_tokens=args.max_tokens,
-            use_utility=use_utility,
-            fallback=not args.no_fallback,
-            sufficiency_threshold=args.sufficiency_threshold,
-        )
+        result = _retrieve(memory, q["question"], args, use_utility=use_utility, retrieval_mode=retrieval_mode)
         row, reward, hit, _ = base_eval.row_from_result(method, q, result, update_used=update and route.update_behavioral_edges)
-        route_dict = route_to_dict(route)
-        row.update(route_dict)
+        row.update(route_to_dict(route))
+        row["retrieval_mode"] = retrieval_mode
         rows.append(row)
         if update:
             update_behavioral_edges_from_feedback(
@@ -109,39 +132,82 @@ def run_eval(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     questions = load_questions(args.questions_json, args.max_questions)
     train_q, test_q = base_eval.split_questions(questions, args.train_ratio)
-    print(f"[behavioral-eval] graph={args.memory_graph} questions={len(questions)} train={len(train_q)} test={len(test_q)}", flush=True)
+    print(
+        f"[behavioral-eval] graph={args.memory_graph} questions={len(questions)} train={len(train_q)} test={len(test_q)} "
+        f"retrieval_mode={args.retrieval_mode}",
+        flush=True,
+    )
 
+    modes = ["profile", "dual_path"] if args.retrieval_mode == "both" else [args.retrieval_mode]
     all_rows: List[Dict[str, Any]] = []
     trace_path = out_dir / "behavioral_profile_trace.jsonl"
+    trained_memories: Dict[str, ProfileCentricHypergraphMemory] = {}
+    baseline_memories: Dict[str, ProfileCentricHypergraphMemory] = {}
+
     with trace_path.open("w", encoding="utf-8") as trace:
-        baseline_memory = ProfileCentricHypergraphMemory.load(args.memory_graph)
-        baseline_memory.learning_rate = args.learning_rate
-        baseline_rows = run_behavioral_questions(
-            baseline_memory, test_q, args, "embedding_only_behavioral_profile", use_utility=False, update=False, trace_file=trace
-        )
-        all_rows.extend(baseline_rows)
+        for mode in modes:
+            baseline_memory = ProfileCentricHypergraphMemory.load(args.memory_graph)
+            baseline_memory.learning_rate = args.learning_rate
+            baseline_memories[mode] = baseline_memory
+            baseline_method = "embedding_only_behavioral_profile" if mode == "profile" else "dual_path_embedding_only"
+            baseline_rows = run_behavioral_questions(
+                baseline_memory,
+                test_q,
+                args,
+                baseline_method,
+                use_utility=False,
+                update=False,
+                retrieval_mode=mode,
+                trace_file=trace,
+            )
+            all_rows.extend(baseline_rows)
 
-        learned_memory = ProfileCentricHypergraphMemory.load(args.memory_graph)
-        learned_memory.learning_rate = args.learning_rate
-        train_rows = run_behavioral_questions(
-            learned_memory, train_q, args, "reward_guided_behavioral_train", use_utility=True, update=True, trace_file=trace
-        )
-        test_rows = run_behavioral_questions(
-            learned_memory, test_q, args, "reward_guided_behavioral_frozen_test", use_utility=True, update=False, trace_file=trace
-        )
-        all_rows.extend(train_rows)
-        all_rows.extend(test_rows)
+            learned_memory = ProfileCentricHypergraphMemory.load(args.memory_graph)
+            learned_memory.learning_rate = args.learning_rate
+            trained_memories[mode] = learned_memory
+            train_method = "reward_guided_behavioral_train" if mode == "profile" else "reward_guided_dual_path_train"
+            test_method = "reward_guided_behavioral_frozen_test" if mode == "profile" else "reward_guided_dual_path_frozen_test"
+            train_rows = run_behavioral_questions(
+                learned_memory,
+                train_q,
+                args,
+                train_method,
+                use_utility=True,
+                update=True,
+                retrieval_mode=mode,
+                trace_file=trace,
+            )
+            test_rows = run_behavioral_questions(
+                learned_memory,
+                test_q,
+                args,
+                test_method,
+                use_utility=True,
+                update=False,
+                retrieval_mode=mode,
+                trace_file=trace,
+            )
+            all_rows.extend(train_rows)
+            all_rows.extend(test_rows)
 
-    learned_memory.save(out_dir / "behavioral_trained_memory.json")
-    baseline_memory.save(out_dir / "behavioral_embedding_only_memory.json")
+    # Keep the profile-mode trained memory as the default legacy output. Also
+    # save dual-path trained memory separately when present.
+    if "profile" in trained_memories:
+        trained_memories["profile"].save(out_dir / "behavioral_trained_memory.json")
+    if "dual_path" in trained_memories:
+        trained_memories["dual_path"].save(out_dir / "dual_path_trained_memory.json")
+    if "profile" in baseline_memories:
+        baseline_memories["profile"].save(out_dir / "behavioral_embedding_only_memory.json")
+
     write_rows(out_dir / "behavioral_profile_results.csv", all_rows)
 
     by_method: Dict[str, List[Dict[str, Any]]] = {}
     for row in all_rows:
         by_method.setdefault(row["method"], []).append(row)
 
+    pool_source = trained_memories.get("dual_path") or trained_memories.get("profile") or ProfileCentricHypergraphMemory.load(args.memory_graph)
     pool = write_behavioral_pool(
-        learned_memory,
+        pool_source,
         out_dir / "high_value_behavioral_pool.json",
         top_k=args.pool_top_k,
         min_value=args.pool_min_value,
@@ -151,21 +217,23 @@ def run_eval(args: argparse.Namespace) -> None:
     summary = {
         "pipeline": [
             "load_post_hierarchy_open_set_behavioral_hyperedges",
-            "embed_query_and_behavioral_hyperedges",
-            "retrieve_behavioral_hyperedges_then_member_facts",
+            "profile_path_query_to_behavioral_hyperedges_to_member_facts_to_source_episodes",
+            "topic_path_query_to_topics_to_episodes_to_facts",
+            "episode_level_alignment_and_fact_fusion",
             "route_query_for_reward_update_only",
             "train_reward_guided_hyperedge_utility_on_behavioral_or_mixed_train_qa",
             "export_high_value_behavioral_memory_pool",
         ],
-        "design_note": "Retrieval is behavioral-hyperedge first. Query routing controls reward updates so episodic/detail questions do not deactivate behavioral profile hyperedges.",
+        "design_note": "Dual-path mode aligns evidence from behavioral profile hyperedges and topic-episode timeline retrieval. Existing profile-only retrieval is still evaluated for ablation.",
         "memory_graph": args.memory_graph,
+        "retrieval_mode": args.retrieval_mode,
         "learning_rate": args.learning_rate,
         "num_questions": len(questions),
         "num_train_questions": len(train_q),
         "num_test_questions": len(test_q),
         "route_counts": route_counts(all_rows),
         "methods": {method: base_eval.summarize(rows) for method, rows in by_method.items()},
-        "behavioral_profile": behavioral_profile_summary(learned_memory, top_k=args.pool_top_k),
+        "behavioral_profile": behavioral_profile_summary(pool_source, top_k=args.pool_top_k),
         "high_value_pool_size": len(pool),
     }
     (out_dir / "behavioral_profile_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -201,6 +269,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pool-min-value", type=float, default=0.0)
     parser.add_argument("--pool-min-utility", type=float, default=0.0)
     parser.add_argument("--pool-require-positive-feedback", action="store_true")
+    parser.add_argument("--retrieval-mode", choices=["profile", "dual_path", "both"], default="both")
+    parser.add_argument("--top-k-topics", type=int, default=3)
+    parser.add_argument("--top-k-episodes", type=int, default=6)
+    parser.add_argument("--dual-profile-weight", type=float, default=0.38)
+    parser.add_argument("--dual-topic-weight", type=float, default=0.32)
+    parser.add_argument("--dual-episode-weight", type=float, default=0.18)
+    parser.add_argument("--dual-alignment-weight", type=float, default=0.12)
     args = parser.parse_args()
     args.embedding_dim = 512
     args.attach_threshold = 0.52
