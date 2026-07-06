@@ -34,30 +34,60 @@ PROFILE_DIMENSIONS = [
     "temporal_update",
     "tool_or_workflow",
     "domain_knowledge",
+    "research_focus",
+    "writing_or_reporting_style",
     "other_specific_profile_feature",
 ]
 
 
+EXACT_FEATURE_TYPE_TO_EDGE_TYPE = {
+    "identity_and_values": ProfileEdgeType.PREFERENCE,
+    "preference": ProfileEdgeType.PREFERENCE,
+    "habit_or_routine": ProfileEdgeType.HABIT,
+    "relationship": ProfileEdgeType.PREFERENCE,
+    "family": ProfileEdgeType.CURRENT_STATE,
+    "work_or_study": ProfileEdgeType.CURRENT_STATE,
+    "health_and_wellbeing": ProfileEdgeType.CURRENT_STATE,
+    "life_event": ProfileEdgeType.TEMPORAL_EVOLUTION,
+    "goal_or_plan": ProfileEdgeType.GOAL,
+    "emotion_or_current_state": ProfileEdgeType.CURRENT_STATE,
+    "communication_style": ProfileEdgeType.HABIT,
+    "activity_or_hobby": ProfileEdgeType.HABIT,
+    "temporal_update": ProfileEdgeType.TEMPORAL_EVOLUTION,
+    "tool_or_workflow": ProfileEdgeType.TOOL_USAGE,
+    "domain_knowledge": ProfileEdgeType.DOMAIN_KNOWLEDGE,
+    "research_focus": ProfileEdgeType.RESEARCH_FOCUS,
+    "writing_or_reporting_style": ProfileEdgeType.WRITING_STYLE,
+}
+
+
 def _edge_type_en(feature_type: str, name: str, desc: str) -> ProfileEdgeType:
-    text = " ".join([feature_type, name, desc]).lower()
-    if any(x in text for x in ["goal", "plan", "intention", "future", "career", "publication"]):
+    normalized_type = feature_type.strip().lower().replace(" ", "_").replace("-", "_")
+    if normalized_type in EXACT_FEATURE_TYPE_TO_EDGE_TYPE:
+        return EXACT_FEATURE_TYPE_TO_EDGE_TYPE[normalized_type]
+
+    text = " ".join([normalized_type, name, desc]).lower()
+    # Specific profile dimensions should take priority over loose word matches.
+    if any(x in text for x in ["communication style", "communication_style", "encouraging language", "supportive language"]):
+        return ProfileEdgeType.HABIT
+    if any(x in text for x in ["temporal", "temporal_update", "life event", "recent update", "timeline", "change over time"]):
+        return ProfileEdgeType.TEMPORAL_EVOLUTION
+    if any(x in text for x in ["writing style", "paper writing", "report writing", "presentation style"]):
+        return ProfileEdgeType.WRITING_STYLE
+    if any(x in text for x in ["research focus", "research topic", "paper topic"]):
+        return ProfileEdgeType.RESEARCH_FOCUS
+    if any(x in text for x in ["goal", "intention", "career aspiration", "publication goal"]):
         return ProfileEdgeType.GOAL
-    if any(x in text for x in ["habit", "routine", "lifestyle", "activity", "hobby", "communication pattern"]):
+    if any(x in text for x in ["habit", "routine", "lifestyle", "activity", "hobby"]):
         return ProfileEdgeType.HABIT
     if any(x in text for x in ["preference", "likes", "dislikes", "values", "identity", "social trait", "empathy"]):
         return ProfileEdgeType.PREFERENCE
     if any(x in text for x in ["current state", "emotion", "wellbeing", "health", "family", "life state", "responsibility"]):
         return ProfileEdgeType.CURRENT_STATE
-    if any(x in text for x in ["temporal", "update", "change over time", "recently", "timeline"]):
-        return ProfileEdgeType.TEMPORAL_EVOLUTION
     if any(x in text for x in ["tool", "workflow", "github", "server", "script", "experiment"]):
         return ProfileEdgeType.TOOL_USAGE
-    if any(x in text for x in ["domain", "knowledge", "algorithm", "memory", "rag", "hypergraph", "locomo"]):
+    if any(x in text for x in ["domain knowledge", "algorithm", "rag", "hypergraph", "locomo"]):
         return ProfileEdgeType.DOMAIN_KNOWLEDGE
-    if any(x in text for x in ["writing style", "paper writing", "report writing", "presentation style"]):
-        return ProfileEdgeType.WRITING_STYLE
-    if any(x in text for x in ["research focus", "research topic", "paper topic"]):
-        return ProfileEdgeType.RESEARCH_FOCUS
     return ProfileEdgeType.AUTO_DISCOVERED
 
 
@@ -87,7 +117,7 @@ class EnglishLLMFeatureClient:
         self.max_features_per_fact = max_features_per_fact
         self.max_tokens = max_tokens
         self.cache = JsonLLMCache(cache_dir=cache_dir, enabled=use_cache)
-        self.prompt_version = "english_profile_induction_v1"
+        self.prompt_version = "english_profile_induction_v2"
 
     def induce(self, facts: Sequence[ProfileFact], existing_edges: Sequence[ProfileHyperedgeUnit]) -> List[LLMFeature]:
         valid_ids = {fact.fact_id for fact in facts}
@@ -184,8 +214,10 @@ class EnglishLLMFeatureClient:
             "'time', 'emotion', 'tool', 'goal', 'preference', 'state', 'misc', or 'other'. "
             "Each feature must have a clear boundary using positive_triggers and negative_triggers. "
             "If a new feature matches an existing feature, reuse the existing edge_id as feature_id; otherwise create a new id. "
-            "Use feature_type values close to these profile dimensions: "
-            f"{', '.join(PROFILE_DIMENSIONS)}.\n\n"
+            "Use feature_type values close to these profile dimensions, not arbitrary broad labels: "
+            f"{', '.join(PROFILE_DIMENSIONS)}. "
+            "Use communication_style only for stable ways the user communicates, not for domain knowledge. "
+            "Use temporal_update or life_event for time-bounded plans/events, not goal_or_plan unless it is a persistent intention.\n\n"
             "Return strict JSON only in this schema:\n"
             "{\"features\":[{\"feature_id\":\"new_or_existing_id\",\"feature_name\":\"specific English name\","
             "\"feature_type\":\"profile_dimension\",\"description\":\"English boundary description\","
