@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hypermem.batch_profile_builder import build_profile_hypergraph_from_rows
 from hypermem.profile_centric_hypergraph import ProfileCentricHypergraphMemory, ProfileRetrievalResult, keyword_overlap
 
 
@@ -152,7 +153,10 @@ def reward_from_result(hit: int, recall: float, tokens: int, fallback_used: bool
 
 def build_memory(memory_rows: Sequence[Dict[str, Any]], args: argparse.Namespace, label: str) -> ProfileCentricHypergraphMemory:
     started = time.time()
-    print(f"[build_memory] START {label} rows={len(memory_rows)}", flush=True)
+    print(
+        f"[build_memory] START {label} rows={len(memory_rows)} construction_mode={args.construction_mode}",
+        flush=True,
+    )
     memory = ProfileCentricHypergraphMemory(
         user_id="profile_eval_user",
         attach_threshold=args.attach_threshold,
@@ -160,11 +164,23 @@ def build_memory(memory_rows: Sequence[Dict[str, Any]], args: argparse.Namespace
         learning_rate=args.learning_rate,
         embedding_dim=args.embedding_dim,
     )
-    memory.build_from_rows(
-        memory_rows,
-        show_progress=not args.no_progress,
-        max_auto_edge_pairs=args.max_auto_edge_pairs,
-    )
+    if args.construction_mode == "batch":
+        build_profile_hypergraph_from_rows(
+            memory,
+            memory_rows,
+            batch_size=args.batch_size,
+            canonical_threshold=args.canonical_threshold,
+            min_feature_support=args.min_feature_support,
+            consolidate_every=args.consolidate_every,
+            max_edge_facts=args.max_edge_facts,
+            show_progress=not args.no_progress,
+        )
+    else:
+        memory.build_from_rows(
+            memory_rows,
+            show_progress=not args.no_progress,
+            max_auto_edge_pairs=args.max_auto_edge_pairs,
+        )
     exported = memory.export()
     print(
         f"[build_memory] DONE  {label} elapsed={time.time() - started:.2f}s "
@@ -287,7 +303,8 @@ def run_eval(args: argparse.Namespace) -> None:
         "[eval] loaded "
         f"memory_rows={len(memory_rows)} questions={len(questions)} "
         f"train={len(train_q)} test={len(test_q)} online_eval={int(args.online_eval)} "
-        f"max_auto_edge_pairs={args.max_auto_edge_pairs}",
+        f"construction_mode={args.construction_mode} batch_size={args.batch_size} "
+        f"canonical_threshold={args.canonical_threshold} max_edge_facts={args.max_edge_facts}",
         flush=True,
     )
 
@@ -339,6 +356,10 @@ def run_eval(args: argparse.Namespace) -> None:
         "num_test_questions": len(test_q),
         "train_ratio": args.train_ratio,
         "embedding_dim": args.embedding_dim,
+        "construction_mode": args.construction_mode,
+        "batch_size": args.batch_size,
+        "canonical_threshold": args.canonical_threshold,
+        "max_edge_facts": args.max_edge_facts,
         "methods": {method: summarize(rows) for method, rows in by_method.items()},
         "trained_profile": utility_memory.export(),
     }
@@ -376,7 +397,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-dim", type=int, default=512)
     parser.add_argument("--attach-threshold", type=float, default=0.52)
     parser.add_argument("--discovery-threshold", type=float, default=0.55)
-    parser.add_argument("--max-auto-edge-pairs", type=int, default=0, help="Maximum auto-edge pair comparisons during discovery. Use 0 for unlimited.")
+    parser.add_argument("--construction-mode", choices=["batch", "online_attach"], default="batch")
+    parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument("--canonical-threshold", type=float, default=0.62)
+    parser.add_argument("--min-feature-support", type=int, default=1)
+    parser.add_argument("--consolidate-every", type=int, default=5)
+    parser.add_argument("--max-edge-facts", type=int, default=600)
+    parser.add_argument("--max-auto-edge-pairs", type=int, default=0, help="Maximum auto-edge pair comparisons during online_attach discovery. Use 0 for unlimited.")
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm/progress logging.")
     parser.add_argument("--no-fallback", action="store_true")
     parser.add_argument("--max-memory", type=int, default=0)
