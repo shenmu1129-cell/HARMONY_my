@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -40,16 +41,61 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def fact_dialogue_id(fact: ProfileFact) -> str:
+def normalize_text(text: str) -> str:
+    text = str(text or "").lower().strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def content_keys(text: str) -> List[str]:
+    base_text = normalize_text(text)
+    keys = [base_text]
+    for prefix in ("persona statement:", "dialogue context:", "expected response:", "hyperedge condition:"):
+        if base_text.startswith(prefix):
+            keys.append(normalize_text(base_text[len(prefix):]))
+    return [k for k in dict.fromkeys(keys) if k]
+
+
+def find_dialogue_id_in_obj(obj: Any, depth: int = 0) -> str:
+    if depth > 4:
+        return ""
+    if isinstance(obj, dict):
+        for key in ("dialogue_id", "dialog_id", "conversation_id"):
+            if obj.get(key):
+                return str(obj[key])
+        for val in obj.values():
+            found = find_dialogue_id_in_obj(val, depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for val in obj:
+            found = find_dialogue_id_in_obj(val, depth + 1)
+            if found:
+                return found
+    return ""
+
+
+def build_content_dialogue_lookup(memory_rows: Sequence[Dict[str, Any]]) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    for row in memory_rows:
+        did = str(row.get("dialogue_id") or "")
+        content = str(row.get("content") or "")
+        if not did or not content:
+            continue
+        for key in content_keys(content):
+            lookup.setdefault(key, did)
+    return lookup
+
+
+def fact_dialogue_id(fact: ProfileFact, content_lookup: Dict[str, str] | None = None) -> str:
     meta = fact.metadata or {}
-    if meta.get("dialogue_id"):
-        return str(meta["dialogue_id"])
-    nested = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
-    if nested.get("dialogue_id"):
-        return str(nested["dialogue_id"])
-    row = nested.get("fact") if isinstance(nested.get("fact"), dict) else {}
-    if row.get("dialogue_id"):
-        return str(row["dialogue_id"])
+    found = find_dialogue_id_in_obj(meta)
+    if found:
+        return found
+    if content_lookup:
+        for key in content_keys(fact.content):
+            if key in content_lookup:
+                return content_lookup[key]
     return ""
 
 
@@ -137,6 +183,7 @@ def rank_facts(memory: ProfileCentricHypergraphMemory, query: str, fact_ids: Ite
 def conditioned_dialogue_retrieve(
     memory: ProfileCentricHypergraphMemory,
     dialogue_index: Dict[str, List[Dict[str, Any]]],
+    content_lookup: Dict[str, str],
     query: str,
     *,
     top_k_edges: int,
@@ -153,13 +200,13 @@ def conditioned_dialogue_retrieve(
 
     dialogue_ids = []
     for fact in selected_facts:
-        did = fact_dialogue_id(fact)
+        did = fact_dialogue_id(fact, content_lookup)
         if did:
             dialogue_ids.append(did)
     if not dialogue_ids:
-        for fid in member_fact_ids[:20]:
+        for fid in member_fact_ids[:30]:
             fact = memory.facts.get(fid)
-            did = fact_dialogue_id(fact) if fact else ""
+            did = fact_dialogue_id(fact, content_lookup) if fact else ""
             if did:
                 dialogue_ids.append(did)
     dialogue_ids = list(dict.fromkeys(dialogue_ids))[:top_k_edges]
@@ -207,15 +254,15 @@ def conditioned_dialogue_retrieve(
     )
 
 
-def retrieve_method(method: str, memory, dialogue_index, question: str, args) -> ProfileRetrievalResult:
+def retrieve_method(method: str, memory, dialogue_index, content_lookup, question: str, args) -> ProfileRetrievalResult:
     if method == "adaptive_tiny":
         return retrieve_budget_aware(memory, question, top_k_edges=2, top_k_facts=4, max_tokens=110, use_utility=False, top_k_topics=2, top_k_episodes=3, budget_ratio=1.0)
     if method == "condition_dialogue":
-        return conditioned_dialogue_retrieve(memory, dialogue_index, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=True, include_facts=False)
+        return conditioned_dialogue_retrieve(memory, dialogue_index, content_lookup, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=True, include_facts=False)
     if method == "condition_fact_dialogue":
-        return conditioned_dialogue_retrieve(memory, dialogue_index, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=True, include_facts=True)
+        return conditioned_dialogue_retrieve(memory, dialogue_index, content_lookup, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=True, include_facts=True)
     if method == "fact_dialogue":
-        return conditioned_dialogue_retrieve(memory, dialogue_index, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=False, include_facts=True)
+        return conditioned_dialogue_retrieve(memory, dialogue_index, content_lookup, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=False, include_facts=True)
     raise ValueError(method)
 
 
@@ -259,6 +306,7 @@ def main() -> None:
     memory = ProfileCentricHypergraphMemory.load(args.memory_graph)
     memory_rows = read_jsonl(Path(args.memory_json))
     dialogue_index = build_dialogue_index(memory_rows)
+    content_lookup = build_content_dialogue_lookup(memory_rows)
     questions = base.normalize_questions(base.read_json_or_jsonl(Path(args.questions_json)))[: args.max_questions]
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     rows: List[Dict[str, Any]] = []
@@ -267,7 +315,7 @@ def main() -> None:
         start = time.time()
         for q in questions:
             t0 = time.time()
-            result = retrieve_method(method, memory, dialogue_index, q["question"], args)
+            result = retrieve_method(method, memory, dialogue_index, content_lookup, q["question"], args)
             row, _, _, _ = base.row_from_result(method, q, result, update_used=False)
             dbg = result.debug_scores[0] if result.debug_scores else {}
             row.update({
