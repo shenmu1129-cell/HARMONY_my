@@ -1,8 +1,8 @@
 """Probe hyperedge-conditioned dialogue evidence retrieval.
 
 This probe treats hyperedge summaries as conditions, not final evidence. The
-final evidence is drawn from source-backed facts and original dialogue/memory
-rows that share the same dialogue_id as facts under the retrieved hyperedges.
+final evidence is drawn from source-backed facts and local dialogue/memory rows
+around those facts.
 """
 
 from __future__ import annotations
@@ -33,18 +33,18 @@ from hypermem.profile_centric_hypergraph import (  # noqa: E402
 
 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            rows.append(json.loads(line))
-    return rows
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def normalize_text(text: str) -> str:
-    text = str(text or "").lower().strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
+    return re.sub(r"\s+", " ", str(text or "").lower().strip())
+
+
+def clip_words(text: str, max_words: int) -> str:
+    words = str(text or "").split()
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words])
 
 
 def content_keys(text: str) -> List[str]:
@@ -75,30 +75,6 @@ def find_dialogue_id_in_obj(obj: Any, depth: int = 0) -> str:
     return ""
 
 
-def build_content_dialogue_lookup(memory_rows: Sequence[Dict[str, Any]]) -> Dict[str, str]:
-    lookup: Dict[str, str] = {}
-    for row in memory_rows:
-        did = str(row.get("dialogue_id") or "")
-        content = str(row.get("content") or "")
-        if not did or not content:
-            continue
-        for key in content_keys(content):
-            lookup.setdefault(key, did)
-    return lookup
-
-
-def fact_dialogue_id(fact: ProfileFact, content_lookup: Dict[str, str] | None = None) -> str:
-    meta = fact.metadata or {}
-    found = find_dialogue_id_in_obj(meta)
-    if found:
-        return found
-    if content_lookup:
-        for key in content_keys(fact.content):
-            if key in content_lookup:
-                return content_lookup[key]
-    return ""
-
-
 def row_sort_key(row: Dict[str, Any]) -> Tuple[int, int, str]:
     return (int(row.get("timestamp") or 0), int(row.get("turn_idx") or 0), str(row.get("source_type") or ""))
 
@@ -112,6 +88,71 @@ def build_dialogue_index(memory_rows: Sequence[Dict[str, Any]]) -> Dict[str, Lis
     for did in list(by_dialogue):
         by_dialogue[did] = sorted(by_dialogue[did], key=row_sort_key)
     return by_dialogue
+
+
+def build_content_maps(memory_rows: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+    did_lookup: Dict[str, str] = {}
+    row_lookup: Dict[str, Dict[str, Any]] = {}
+    for row in memory_rows:
+        did = str(row.get("dialogue_id") or "")
+        content = str(row.get("content") or "")
+        if not did or not content:
+            continue
+        for key in content_keys(content):
+            did_lookup.setdefault(key, did)
+            row_lookup.setdefault(key, row)
+    return did_lookup, row_lookup
+
+
+def fact_dialogue_id(fact: ProfileFact, content_lookup: Dict[str, str] | None = None) -> str:
+    found = find_dialogue_id_in_obj(fact.metadata or {})
+    if found:
+        return found
+    if content_lookup:
+        for key in content_keys(fact.content):
+            if key in content_lookup:
+                return content_lookup[key]
+    return ""
+
+
+def row_for_fact(fact: ProfileFact, row_lookup: Dict[str, Dict[str, Any]]) -> Dict[str, Any] | None:
+    for key in content_keys(fact.content):
+        if key in row_lookup:
+            return row_lookup[key]
+    return None
+
+
+def local_dialogue_rows(
+    dialogue_index: Dict[str, List[Dict[str, Any]]],
+    row_lookup: Dict[str, Dict[str, Any]],
+    selected_facts: Sequence[ProfileFact],
+    fallback_dialogue_ids: Sequence[str],
+    *,
+    window: int = 1,
+) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    seen = set()
+    anchor_rows = [row_for_fact(f, row_lookup) for f in selected_facts]
+    anchor_rows = [r for r in anchor_rows if r]
+    for anchor in anchor_rows:
+        did = str(anchor.get("dialogue_id") or "")
+        rows = dialogue_index.get(did, [])
+        try:
+            idx = next(i for i, r in enumerate(rows) if r is anchor or normalize_text(r.get("content")) == normalize_text(anchor.get("content")))
+        except StopIteration:
+            idx = 0
+        lo, hi = max(0, idx - window), min(len(rows), idx + window + 1)
+        for row in rows[lo:hi]:
+            key = (row.get("dialogue_id"), row.get("timestamp"), row.get("content"))
+            if key not in seen:
+                seen.add(key); selected.append(row)
+    if not selected:
+        for did in fallback_dialogue_ids:
+            for row in dialogue_index.get(did, [])[:4]:
+                key = (row.get("dialogue_id"), row.get("timestamp"), row.get("content"))
+                if key not in seen:
+                    seen.add(key); selected.append(row)
+    return selected
 
 
 def pack_text_rows(rows: Iterable[Dict[str, Any]], max_tokens: int, max_rows: int) -> List[ProfileFact]:
@@ -184,6 +225,7 @@ def conditioned_dialogue_retrieve(
     memory: ProfileCentricHypergraphMemory,
     dialogue_index: Dict[str, List[Dict[str, Any]]],
     content_lookup: Dict[str, str],
+    row_lookup: Dict[str, Dict[str, Any]],
     query: str,
     *,
     top_k_edges: int,
@@ -216,7 +258,7 @@ def conditioned_dialogue_retrieve(
         for idx, (edge, score) in enumerate(edges, 1):
             condition_facts.append(ProfileFact(
                 fact_id=f"condition_{idx:04d}",
-                content=f"Hyperedge condition: {edge.summary}",
+                content=f"Hyperedge condition: {clip_words(edge.summary, 24)}",
                 keywords=edge.keywords,
                 timestamp=0.0,
                 embedding=edge.embedding,
@@ -225,10 +267,8 @@ def conditioned_dialogue_retrieve(
 
     used = estimate_tokens([f.content for f in condition_facts + selected_facts])
     remaining = max(1, max_tokens - used)
-    dialogue_rows: List[Dict[str, Any]] = []
-    for did in dialogue_ids:
-        dialogue_rows.extend(dialogue_index.get(did, []))
-    dialogue_facts = pack_text_rows(dialogue_rows, max_tokens=remaining, max_rows=8)
+    rows = local_dialogue_rows(dialogue_index, row_lookup, selected_facts, dialogue_ids, window=1)
+    dialogue_facts = pack_text_rows(rows, max_tokens=remaining, max_rows=6)
 
     final = condition_facts + selected_facts + dialogue_facts
     return ProfileRetrievalResult(
@@ -254,15 +294,15 @@ def conditioned_dialogue_retrieve(
     )
 
 
-def retrieve_method(method: str, memory, dialogue_index, content_lookup, question: str, args) -> ProfileRetrievalResult:
+def retrieve_method(method: str, memory, dialogue_index, content_lookup, row_lookup, question: str, args) -> ProfileRetrievalResult:
     if method == "adaptive_tiny":
         return retrieve_budget_aware(memory, question, top_k_edges=2, top_k_facts=4, max_tokens=110, use_utility=False, top_k_topics=2, top_k_episodes=3, budget_ratio=1.0)
     if method == "condition_dialogue":
-        return conditioned_dialogue_retrieve(memory, dialogue_index, content_lookup, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=True, include_facts=False)
+        return conditioned_dialogue_retrieve(memory, dialogue_index, content_lookup, row_lookup, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=True, include_facts=False)
     if method == "condition_fact_dialogue":
-        return conditioned_dialogue_retrieve(memory, dialogue_index, content_lookup, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=True, include_facts=True)
+        return conditioned_dialogue_retrieve(memory, dialogue_index, content_lookup, row_lookup, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=True, include_facts=True)
     if method == "fact_dialogue":
-        return conditioned_dialogue_retrieve(memory, dialogue_index, content_lookup, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=False, include_facts=True)
+        return conditioned_dialogue_retrieve(memory, dialogue_index, content_lookup, row_lookup, question, top_k_edges=2, top_k_facts=4, max_tokens=args.max_tokens, include_condition=False, include_facts=True)
     raise ValueError(method)
 
 
@@ -306,7 +346,7 @@ def main() -> None:
     memory = ProfileCentricHypergraphMemory.load(args.memory_graph)
     memory_rows = read_jsonl(Path(args.memory_json))
     dialogue_index = build_dialogue_index(memory_rows)
-    content_lookup = build_content_dialogue_lookup(memory_rows)
+    content_lookup, row_lookup = build_content_maps(memory_rows)
     questions = base.normalize_questions(base.read_json_or_jsonl(Path(args.questions_json)))[: args.max_questions]
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     rows: List[Dict[str, Any]] = []
@@ -315,7 +355,7 @@ def main() -> None:
         start = time.time()
         for q in questions:
             t0 = time.time()
-            result = retrieve_method(method, memory, dialogue_index, content_lookup, q["question"], args)
+            result = retrieve_method(method, memory, dialogue_index, content_lookup, row_lookup, q["question"], args)
             row, _, _, _ = base.row_from_result(method, q, result, update_used=False)
             dbg = result.debug_scores[0] if result.debug_scores else {}
             row.update({
