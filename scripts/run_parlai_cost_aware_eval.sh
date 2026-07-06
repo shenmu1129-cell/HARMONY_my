@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # Run the cost-aware hypergraph retrieval test on local ParlAI datasets.
-# Default uses a 50-memory graph and all generated questions, matching the
-# current debugging setup where LoCoMo is too large.
+# Default is a light Persona-Chat smoke test: 50 memory rows + 1000 questions.
 #
 # Usage:
 #   bash scripts/run_parlai_cost_aware_eval.sh
@@ -11,7 +10,7 @@ set -euo pipefail
 # Useful env controls:
 #   OUT_ROOT=outputs/parlai_cost_aware
 #   MAX_MEMORY=50
-#   MAX_QUESTIONS=1000000
+#   MAX_QUESTIONS=1000
 #   USE_LLM_HIERARCHY=0       # 0 = fast fallback hierarchy, 1 = DeepSeek hierarchy
 #   DATASET_ROOTS="/path/Persona-Chat /path/ConvAI2 /path/msc"
 #   METHODS="profile_full,topic_episode,progressive,budget,adaptive_budget,adaptive_tiny"
@@ -19,7 +18,7 @@ set -euo pipefail
 
 OUT_ROOT=${OUT_ROOT:-outputs/parlai_cost_aware}
 MAX_MEMORY=${MAX_MEMORY:-50}
-MAX_QUESTIONS=${MAX_QUESTIONS:-1000000}
+MAX_QUESTIONS=${MAX_QUESTIONS:-1000}
 USE_LLM_HIERARCHY=${USE_LLM_HIERARCHY:-0}
 NO_PROGRESS=${NO_PROGRESS:-0}
 METHODS=${METHODS:-profile_full,topic_episode,progressive,budget,adaptive_budget,adaptive_tiny}
@@ -39,23 +38,23 @@ CONSOLIDATE_EVERY=${CONSOLIDATE_EVERY:-2}
 MAX_EDGE_FACTS=${MAX_EDGE_FACTS:-80}
 
 if [[ -z "${DATASET_ROOTS:-}" ]]; then
-  DATASET_ROOTS="/home/sutongtong/wwt/dataset/Persona-Chat /home/sutongtong/wwt/dataset/ConvAI2 /home/sutongtong/wwt/dataset/msc"
+  DATASET_ROOTS="/home/sutongtong/wwt/dataset/Persona-Chat"
 fi
 
 mkdir -p "${OUT_ROOT}/logs"
 LOG_FILE="${OUT_ROOT}/logs/parlai_cost_aware_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
-PROGRESS_ARG=--show-progress
-EVAL_PROGRESS_ARG=()
+PROGRESS_ARG="--show-progress"
+EVAL_PROGRESS_ARG=""
 if [[ "${NO_PROGRESS}" == "1" ]]; then
   PROGRESS_ARG=""
-  EVAL_PROGRESS_ARG=(--no-progress)
+  EVAL_PROGRESS_ARG="--no-progress"
 fi
 
-HIERARCHY_ARGS=()
+HIERARCHY_ARGS=""
 if [[ "${USE_LLM_HIERARCHY}" != "1" ]]; then
-  HIERARCHY_ARGS=(--no-llm-hierarchy)
+  HIERARCHY_ARGS="--no-llm-hierarchy"
 fi
 
 echo "=============================================================================="
@@ -76,6 +75,7 @@ python -m py_compile examples/prepare_parlai_memory_data.py
 python -m py_compile examples/build_behavioral_hybrid_memory.py
 python -m py_compile examples/eval_behavioral_profile_graph.py
 python -m py_compile hypermem/cost_aware_retrieval.py
+bash -n scripts/run_parlai_cost_aware_eval.sh
 
 SUMMARY_FILES=()
 for ROOT in ${DATASET_ROOTS}; do
@@ -115,10 +115,10 @@ for ROOT in ${DATASET_ROOTS}; do
     --consolidate-every "${CONSOLIDATE_EVERY}" \
     --llm-consolidation-rounds 0 \
     --max-edge-facts "${MAX_EDGE_FACTS}" \
-    "${HIERARCHY_ARGS[@]}" \
-    "${EVAL_PROGRESS_ARG[@]}"
+    ${HIERARCHY_ARGS} \
+    ${EVAL_PROGRESS_ARG}
 
-  echo "[3/3] Cost-aware eval on all generated questions -> ${EVAL_OUT}"
+  echo "[3/3] Cost-aware eval on generated questions -> ${EVAL_OUT}"
   python examples/eval_behavioral_profile_graph.py \
     --memory-graph "${GRAPH_OUT}/behavioral_hybrid_graph.json" \
     --questions-json "${DATA_OUT}/questions.jsonl" \
@@ -134,7 +134,7 @@ for ROOT in ${DATASET_ROOTS}; do
     --expansion-ratio "${EXPANSION_RATIO}" \
     --tiny-budget-tokens "${TINY_BUDGET_TOKENS}" \
     --representative-facts-per-edge "${REP_FACTS_PER_EDGE}" \
-    "${EVAL_PROGRESS_ARG[@]}"
+    ${EVAL_PROGRESS_ARG}
 
   SUMMARY_FILES+=("${EVAL_OUT}/cost_aware_summary.csv")
   echo "Summary: ${EVAL_OUT}/cost_aware_summary.csv"
