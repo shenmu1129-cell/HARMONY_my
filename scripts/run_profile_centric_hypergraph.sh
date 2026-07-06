@@ -4,6 +4,16 @@ set -euo pipefail
 # One-command pipeline for the single retained method.
 # Usage:
 #   bash scripts/run_profile_centric_hypergraph.sh SOURCE_DIR OUT_ROOT [DATA_FRACTION] [TRAIN_RATIO]
+#
+# Useful controls:
+#   CONSTRUCTION_MODE=batch|online_attach   default: batch
+#   BATCH_SIZE=200                          facts per feature-induction batch
+#   CANONICAL_THRESHOLD=0.62                feature canonicalization threshold
+#   MIN_FEATURE_SUPPORT=1                   minimum facts for a batch feature
+#   CONSOLIDATE_EVERY=5                     consolidate feature bank every N batches
+#   MAX_EDGE_FACTS=600                      split oversized feature hyperedges
+#   ONLINE_EVAL=0|1                         disable/enable online prequential eval
+#   NO_PROGRESS=0|1                         disable progress bars when needed
 
 SOURCE_DIR=${1:-DEMO}
 OUT_ROOT=${2:-outputs/profile_centric_hg}
@@ -12,6 +22,12 @@ TRAIN_RATIO=${4:-0.5}
 ONLINE_EVAL=${ONLINE_EVAL:-1}
 MAX_AUTO_EDGE_PAIRS=${MAX_AUTO_EDGE_PAIRS:-0}
 NO_PROGRESS=${NO_PROGRESS:-0}
+CONSTRUCTION_MODE=${CONSTRUCTION_MODE:-batch}
+BATCH_SIZE=${BATCH_SIZE:-200}
+CANONICAL_THRESHOLD=${CANONICAL_THRESHOLD:-0.62}
+MIN_FEATURE_SUPPORT=${MIN_FEATURE_SUPPORT:-1}
+CONSOLIDATE_EVERY=${CONSOLIDATE_EVERY:-5}
+MAX_EDGE_FACTS=${MAX_EDGE_FACTS:-600}
 
 mkdir -p "${OUT_ROOT}/logs" "${OUT_ROOT}/data_full" "${OUT_ROOT}/data_used"
 LOG_FILE="${OUT_ROOT}/logs/profile_centric_$(date +%Y%m%d_%H%M%S).log"
@@ -50,6 +66,12 @@ echo "out_root            : ${OUT_ROOT}"
 echo "data_fraction       : ${DATA_FRACTION}"
 echo "train_ratio         : ${TRAIN_RATIO}"
 echo "online_eval         : ${ONLINE_EVAL}"
+echo "construction_mode   : ${CONSTRUCTION_MODE}"
+echo "batch_size          : ${BATCH_SIZE}"
+echo "canonical_threshold : ${CANONICAL_THRESHOLD}"
+echo "min_feature_support : ${MIN_FEATURE_SUPPORT}"
+echo "consolidate_every   : ${CONSOLIDATE_EVERY}"
+echo "max_edge_facts      : ${MAX_EDGE_FACTS}"
 echo "max_auto_edge_pairs : ${MAX_AUTO_EDGE_PAIRS}"
 echo "no_progress         : ${NO_PROGRESS}"
 echo "started_at          : $(date '+%Y-%m-%d %H:%M:%S')"
@@ -58,15 +80,14 @@ echo "python              : $(python --version)"
 echo "=============================================================================="
 
 python -m py_compile hypermem/profile_centric_hypergraph.py
+python -m py_compile hypermem/batch_profile_builder.py
 python -m py_compile examples/profile_centric_hypergraph_eval.py
 python -m py_compile examples/prepare_profile_centric_data.py
 
 TOTAL_STAGES=3
 PROGRESS_ARG=--show-progress
-EVAL_PROGRESS_ARG=()
 if [[ "${NO_PROGRESS}" == "1" ]]; then
   PROGRESS_ARG=""
-  EVAL_PROGRESS_ARG=(--no-progress)
 fi
 
 stage_begin 1 "${TOTAL_STAGES}" "Prepare memory facts and QA"
@@ -132,6 +153,12 @@ for step in bar:
           "used_questions_path": str(used_questions),
           "train_ratio": float("${TRAIN_RATIO}"),
           "online_eval": int("${ONLINE_EVAL}"),
+          "construction_mode": "${CONSTRUCTION_MODE}",
+          "batch_size": int("${BATCH_SIZE}"),
+          "canonical_threshold": float("${CANONICAL_THRESHOLD}"),
+          "min_feature_support": int("${MIN_FEATURE_SUPPORT}"),
+          "consolidate_every": int("${CONSOLIDATE_EVERY}"),
+          "max_edge_facts": int("${MAX_EDGE_FACTS}"),
           "max_auto_edge_pairs": int("${MAX_AUTO_EDGE_PAIRS}"),
         }
         out = Path("${OUT_ROOT}/data_report.json")
@@ -145,6 +172,12 @@ EVAL_ARGS=(
   --memory-json "${USED_MEMORY}"
   --questions-json "${USED_QUESTIONS}"
   --train-ratio "${TRAIN_RATIO}"
+  --construction-mode "${CONSTRUCTION_MODE}"
+  --batch-size "${BATCH_SIZE}"
+  --canonical-threshold "${CANONICAL_THRESHOLD}"
+  --min-feature-support "${MIN_FEATURE_SUPPORT}"
+  --consolidate-every "${CONSOLIDATE_EVERY}"
+  --max-edge-facts "${MAX_EDGE_FACTS}"
   --max-auto-edge-pairs "${MAX_AUTO_EDGE_PAIRS}"
   --output-dir "${OUT_ROOT}/eval"
 )
