@@ -1,4 +1,9 @@
-"""Build an English LLM-induced profile hypergraph once and save it."""
+"""Build an English LLM-induced behavioral-profile hypergraph once and save it.
+
+The graph stores open-set behavioral/profile hyperedges for recurring or stable
+memory dimensions. Ordinary detail facts remain in the base fact memory and can
+be served by the episodic/tree path in the full hybrid system.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hypermem.behavioral_profile import behavioral_profile_summary, write_behavioral_pool  # noqa: E402
 from hypermem.llm_profile_builder_en import build_english_llm_profile_hypergraph_from_rows  # noqa: E402
 from hypermem.profile_centric_hypergraph import ProfileCentricHypergraphMemory  # noqa: E402
 
@@ -77,6 +83,7 @@ def edge_table(memory: ProfileCentricHypergraphMemory) -> List[Dict[str, Any]]:
                 "feature_type": meta.get("feature_type", ""),
                 "num_facts": len(edge.member_fact_ids),
                 "description": meta.get("feature_description", ""),
+                "memory_layer": "behavioral_profile_candidate",
             }
         )
     return sorted(rows, key=lambda row: row["num_facts"], reverse=True)
@@ -96,6 +103,7 @@ def all_edge_table(memory: ProfileCentricHypergraphMemory) -> List[Dict[str, Any
                 "feature_type": meta.get("feature_type", ""),
                 "num_facts": len(edge.member_fact_ids),
                 "description": meta.get("feature_description", ""),
+                "memory_layer": "behavioral_profile_candidate",
             }
         )
     return sorted(rows, key=lambda row: (row["status"] != "active", -row["num_facts"], row["edge_id"]))
@@ -113,6 +121,7 @@ def main() -> None:
     parser.add_argument("--max-edge-facts", type=int, default=160)
     parser.add_argument("--max-features-per-batch", type=int, default=12)
     parser.add_argument("--max-features-per-fact", type=int, default=4)
+    parser.add_argument("--pool-top-k", type=int, default=50)
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
 
@@ -123,7 +132,7 @@ def main() -> None:
     if args.max_memory:
         rows = rows[: args.max_memory]
 
-    memory = ProfileCentricHypergraphMemory(user_id="english_llm_profile_graph")
+    memory = ProfileCentricHypergraphMemory(user_id="behavioral_profile_graph")
     build_english_llm_profile_hypergraph_from_rows(
         memory,
         rows,
@@ -141,15 +150,24 @@ def main() -> None:
     report_path = out_dir / "build_report.json"
     edges_path = out_dir / "active_edges.json"
     all_edges_path = out_dir / "all_edges.json"
+    candidate_pool_path = out_dir / "candidate_behavioral_pool.json"
+    behavioral_summary_path = out_dir / "behavioral_profile_summary.json"
 
     memory.save(graph_path)
+    candidate_pool = write_behavioral_pool(memory, candidate_pool_path, top_k=args.pool_top_k, min_value=0.0, min_utility=0.0)
+    behavioral_summary = behavioral_profile_summary(memory, top_k=args.pool_top_k)
+    behavioral_summary_path.write_text(json.dumps(behavioral_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
     report = {
+        "memory_design": "reward_guided_behavioral_profile_plus_episodic_tree",
+        "design_note": "Behavioral/profile hyperedges store recurring or stable high-value dimensions; ordinary detail facts remain in the base fact/tree path.",
         "num_input_rows": len(rows),
         "num_facts": len(memory.facts),
         "num_edges": len(memory.edges),
         "active_edges": memory.active_edge_count(),
         "edge_type_counts": memory.export().get("edge_type_counts", {}),
         "multi_edge_stats": multi_edge_stats(memory),
+        "candidate_behavioral_pool_size": len(candidate_pool),
         "build_args": vars(args),
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -161,6 +179,8 @@ def main() -> None:
     print("wrote:", report_path)
     print("wrote:", edges_path)
     print("wrote:", all_edges_path)
+    print("wrote:", candidate_pool_path)
+    print("wrote:", behavioral_summary_path)
 
 
 if __name__ == "__main__":
