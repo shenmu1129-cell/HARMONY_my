@@ -44,12 +44,14 @@ def run_eval(args: argparse.Namespace) -> None:
     trace_path = out_dir / "behavioral_profile_trace.jsonl"
     with trace_path.open("w", encoding="utf-8") as trace:
         baseline_memory = ProfileCentricHypergraphMemory.load(args.memory_graph)
+        baseline_memory.learning_rate = args.learning_rate
         baseline_rows = base_eval.run_questions(
             baseline_memory, test_q, args, "embedding_only_behavioral_profile", False, False, trace
         )
         all_rows.extend(baseline_rows)
 
         learned_memory = ProfileCentricHypergraphMemory.load(args.memory_graph)
+        learned_memory.learning_rate = args.learning_rate
         train_rows = base_eval.run_questions(
             learned_memory, train_q, args, "reward_guided_behavioral_train", True, True, trace
         )
@@ -84,6 +86,7 @@ def run_eval(args: argparse.Namespace) -> None:
         ],
         "design_note": "Only recurring, stable, or reward-useful dimensions are promoted to behavioral profile edges; ordinary details stay in the base fact/tree path.",
         "memory_graph": args.memory_graph,
+        "learning_rate": args.learning_rate,
         "num_questions": len(questions),
         "num_train_questions": len(train_q),
         "num_test_questions": len(test_q),
