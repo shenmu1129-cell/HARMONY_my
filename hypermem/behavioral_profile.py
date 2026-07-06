@@ -1,24 +1,22 @@
 """Reward-guided behavioral-profile memory utilities.
 
-This module implements the scheme used by the third design direction:
+This module implements the third design direction:
 
-1. keep ordinary episodic/detail facts in the base memory graph/tree;
-2. induce open-set behavioral profile hyperedges for stable or recurring user patterns;
-3. use QA/retrieval reward as a lightweight contextual-bandit signal;
-4. promote repeatedly useful hyperedges into a high-value behavioral memory pool.
-
-The functions here intentionally work on the existing ProfileCentricHypergraphMemory
-objects so older profile-centric experiments remain backward compatible.
+1. ordinary episodic/detail facts stay in the base Topic-Episode-Fact tree;
+2. open-set behavioral profile hyperedges are induced after hierarchy extraction;
+3. QA/retrieval reward acts as a lightweight contextual-bandit signal;
+4. repeatedly useful hyperedges are promoted into a high-value behavioral pool.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from hypermem.profile_centric_hypergraph import ProfileCentricHypergraphMemory, ProfileHyperedgeUnit, ProfileFact, estimate_tokens
+from hypermem.profile_centric_hypergraph import ProfileCentricHypergraphMemory, ProfileHyperedgeUnit, ProfileFact, clamp
 
 
 def _feature_name(edge: ProfileHyperedgeUnit) -> str:
@@ -33,6 +31,90 @@ def _feature_description(edge: ProfileHyperedgeUnit) -> str:
     return str((edge.metadata or {}).get("feature_description") or edge.summary)
 
 
+def update_behavioral_edge_utility(
+    edge: ProfileHyperedgeUnit,
+    *,
+    reward: float,
+    hit: bool,
+    lr: float = 0.18,
+    route: str = "behavioral",
+    allow_deactivate: bool = False,
+) -> None:
+    """Bandit-style utility update for behavioral hyperedges.
+
+    This is intentionally safer than ProfileHyperedgeUnit.update_utility for the
+    hybrid setting. Episodic/detail queries should not deactivate behavioral
+    edges; they either skip updates or only provide weak negative evidence.
+    """
+    reward = max(-1.0, min(1.0, reward))
+    target = clamp((reward + 1.0) / 2.0)
+    edge.utility_score = clamp((1.0 - lr) * edge.utility_score + lr * target)
+    edge.total_reward += reward
+    edge.last_reward = reward
+    edge.access_count += 1
+    if hit:
+        edge.hit_count += 1
+        edge.stability_score = clamp(edge.stability_score + lr * 0.10)
+        edge.confidence_score = clamp(edge.confidence_score + lr * 0.08)
+    else:
+        edge.failure_count += 1
+        # Mixed queries can be noisy; use a smaller penalty than pure behavioral failures.
+        penalty_scale = 0.04 if route == "mixed" else 0.06
+        edge.stability_score = clamp(edge.stability_score - lr * penalty_scale)
+        edge.confidence_score = clamp(edge.confidence_score - lr * 0.04)
+    if allow_deactivate and edge.failure_count >= 40 and edge.hit_count == 0 and edge.access_count >= 40:
+        edge.status = "inactive"
+    edge.updated_at = time.time()
+
+
+def update_behavioral_edges_from_feedback(
+    memory: ProfileCentricHypergraphMemory,
+    selected_edges: List[ProfileHyperedgeUnit],
+    *,
+    reward: float,
+    hit: bool,
+    route: str,
+    learning_rate: float = 0.18,
+    allow_deactivate: bool = False,
+) -> None:
+    """Update selected behavioral edges only for behavioral or mixed queries."""
+    if route not in {"behavioral", "mixed"}:
+        return
+    for edge in selected_edges:
+        if edge.edge_id not in memory.edges:
+            continue
+        update_behavioral_edge_utility(
+            edge,
+            reward=reward,
+            hit=hit,
+            lr=learning_rate,
+            route=route,
+            allow_deactivate=allow_deactivate,
+        )
+
+
+def initialize_behavioral_priors(memory: ProfileCentricHypergraphMemory, *, prior_strength: float = 0.08) -> None:
+    """Initialize cold-start utility from structural hyperedge features.
+
+    This is not supervised training. It gives a small prior to coherent and
+    evidence-supported hyperedges before QA reward is available.
+    """
+    active = [edge for edge in memory.edges.values() if edge.status == "active"]
+    max_members = max([len(edge.member_fact_ids) for edge in active] or [1])
+    for edge in active:
+        support = math.log1p(len(edge.member_fact_ids)) / math.log1p(max_members)
+        token_penalty = min(1.0, edge.token_cost(memory.facts) / 1200.0)
+        prior = 0.50 + prior_strength * (0.45 * support + 0.35 * edge.confidence_score + 0.20 * edge.coherence_score - 0.20 * token_penalty)
+        edge.utility_score = clamp(prior, lo=0.35, hi=0.75)
+        edge.metadata.setdefault("utility_prior", {})
+        edge.metadata["utility_prior"] = {
+            "support": round(support, 6),
+            "token_penalty": round(token_penalty, 6),
+            "prior_strength": prior_strength,
+            "initialized_utility": round(edge.utility_score, 6),
+        }
+
+
 def behavioral_value(
     edge: ProfileHyperedgeUnit,
     facts: Dict[str, ProfileFact],
@@ -40,12 +122,7 @@ def behavioral_value(
     max_access_count: Optional[int] = None,
     max_member_count: Optional[int] = None,
 ) -> float:
-    """Compute a reward-guided behavioral value for a hyperedge.
-
-    The value is deliberately not just semantic similarity. It favors hyperedges
-    that are stable, coherent, repeatedly selected by queries, and rewarded by QA
-    feedback, while mildly penalizing overly large/token-heavy edges.
-    """
+    """Compute a reward-guided behavioral value for a hyperedge."""
     max_access = max(1, int(max_access_count or edge.access_count or 1))
     max_members = max(1, int(max_member_count or len(edge.member_fact_ids) or 1))
     access_norm = math.log1p(edge.access_count) / math.log1p(max_access)
@@ -116,12 +193,6 @@ def high_value_behavioral_pool(
     min_facts: int = 2,
     require_positive_feedback: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Return high-value behavioral-profile hyperedges after reward updates.
-
-    During a cold build, utility is usually near 0.5 and hit_count is 0, so this
-    function behaves like a ranked structural pool. After training/evaluation
-    feedback, it becomes a reward-guided high-value memory pool.
-    """
     active = [edge for edge in memory.edges.values() if edge.status == "active"]
     max_access = max([edge.access_count for edge in active] or [1])
     max_members = max([len(edge.member_fact_ids) for edge in active] or [1])
@@ -163,10 +234,10 @@ def behavioral_profile_summary(memory: ProfileCentricHypergraphMemory, *, top_k:
     num_failures = sum(edge.failure_count for edge in active)
     num_access = sum(edge.access_count for edge in active)
     return {
-        "memory_design": "reward_guided_behavioral_profile_plus_episodic_tree",
+        "memory_design": "llm_hierarchy_then_reward_guided_behavioral_profile_then_embedding_then_hyperedge_retrieval",
         "behavioral_profile_definition": (
-            "Open-set hyperedges store recurring, stable, or repeatedly useful user behavior/profile patterns. "
-            "Ordinary episodic details remain available as fact-level memory and can be served by the base tree/RAG path."
+            "Open-set behavioral hyperedges are induced after Topic-Episode-Fact extraction. "
+            "Their utility is learned from behavioral/mixed query feedback, and retrieval first selects behavioral hyperedges before selecting member facts."
         ),
         "num_facts": len(memory.facts),
         "num_edges": len(memory.edges),
