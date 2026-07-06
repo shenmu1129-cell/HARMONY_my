@@ -12,6 +12,7 @@ set -euo pipefail
 #   MAX_MEMORY=50
 #   MAX_QUESTIONS=1000
 #   USE_LLM_HIERARCHY=0       # 0 = fast fallback hierarchy, 1 = DeepSeek hierarchy
+#   USE_LLM_BEHAVIOR=0        # 0 = local deterministic hyperedge induction, 1 = DeepSeek behavioral induction
 #   DATASET_ROOTS="/path/Persona-Chat /path/ConvAI2 /path/msc"
 #   METHODS="profile_full,topic_episode,progressive,budget,adaptive_budget,adaptive_tiny"
 #   NO_PROGRESS=0
@@ -20,6 +21,7 @@ OUT_ROOT=${OUT_ROOT:-outputs/parlai_cost_aware}
 MAX_MEMORY=${MAX_MEMORY:-50}
 MAX_QUESTIONS=${MAX_QUESTIONS:-1000}
 USE_LLM_HIERARCHY=${USE_LLM_HIERARCHY:-0}
+USE_LLM_BEHAVIOR=${USE_LLM_BEHAVIOR:-0}
 NO_PROGRESS=${NO_PROGRESS:-0}
 METHODS=${METHODS:-profile_full,topic_episode,progressive,budget,adaptive_budget,adaptive_tiny}
 TOP_K_EDGES=${TOP_K_EDGES:-3}
@@ -57,6 +59,11 @@ if [[ "${USE_LLM_HIERARCHY}" != "1" ]]; then
   HIERARCHY_ARGS="--no-llm-hierarchy"
 fi
 
+BEHAVIOR_ARGS=""
+if [[ "${USE_LLM_BEHAVIOR}" != "1" ]]; then
+  BEHAVIOR_ARGS="--no-llm-behavior"
+fi
+
 echo "=============================================================================="
 echo "ParlAI Cost-aware Hypergraph Evaluation"
 echo "=============================================================================="
@@ -64,6 +71,7 @@ echo "out_root          : ${OUT_ROOT}"
 echo "max_memory        : ${MAX_MEMORY}"
 echo "max_questions     : ${MAX_QUESTIONS}"
 echo "use_llm_hierarchy : ${USE_LLM_HIERARCHY}"
+echo "use_llm_behavior  : ${USE_LLM_BEHAVIOR}"
 echo "methods           : ${METHODS}"
 echo "dataset_roots     : ${DATASET_ROOTS}"
 echo "git_commit        : $(git rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -116,6 +124,7 @@ for ROOT in ${DATASET_ROOTS}; do
     --llm-consolidation-rounds 0 \
     --max-edge-facts "${MAX_EDGE_FACTS}" \
     ${HIERARCHY_ARGS} \
+    ${BEHAVIOR_ARGS} \
     ${EVAL_PROGRESS_ARG}
 
   echo "[3/3] Cost-aware eval on generated questions -> ${EVAL_OUT}"
