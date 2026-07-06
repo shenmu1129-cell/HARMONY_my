@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the new profile-centric hypergraph memory flow.
-#
-# Flow:
-#   1. prepare/convert memory facts and QA
-#   2. optionally keep only a data fraction, e.g. 0.5 for half data
-#   3. build User Profile Hyperedge -> Fact memory
-#   4. train hyperedge utility on train QA
-#   5. evaluate embedding-only, frozen utility, and online predict-then-update
+# One-command pipeline for the single retained method:
+#   1. build/convert memory facts and QA
+#   2. select a data fraction
+#   3. construct user-profile hyperedges
+#   4. build local hashed embeddings
+#   5. train reward utility and evaluate ranked retrieval accuracy
 #
 # Usage:
 #   bash scripts/run_profile_centric_hypergraph.sh SOURCE_DIR OUT_ROOT [DATA_FRACTION] [TRAIN_RATIO]
 #
-# Example:
-#   bash scripts/run_profile_centric_hypergraph.sh /home/sutongtong/wwt/code outputs/profile_centric_hg 0.5 0.5
+# Demo-only usage:
+#   bash scripts/run_profile_centric_hypergraph.sh DEMO outputs/profile_centric_demo 1.0 0.5
 
-SOURCE_DIR=${1:-/home/sutongtong/wwt/code}
+SOURCE_DIR=${1:-DEMO}
 OUT_ROOT=${2:-outputs/profile_centric_hg}
-DATA_FRACTION=${3:-0.5}
+DATA_FRACTION=${3:-1.0}
 TRAIN_RATIO=${4:-0.5}
 
 mkdir -p "${OUT_ROOT}/logs" "${OUT_ROOT}/data_full" "${OUT_ROOT}/data_used"
@@ -80,22 +78,28 @@ echo "==========================================================================
 
 python -m py_compile hypermem/profile_centric_hypergraph.py
 python -m py_compile examples/profile_centric_hypergraph_eval.py
-python -m py_compile examples/prepare_profile_eval_data.py
+python -m py_compile examples/prepare_profile_centric_data.py
 
 TOTAL_STAGES=3
 
-stage_begin 1 "${TOTAL_STAGES}" "Prepare full converted data"
-python examples/prepare_profile_eval_data.py \
-  --source-dir "${SOURCE_DIR}" \
-  --out-dir "${OUT_ROOT}/data_full" \
-  --max-memory 1000000 \
-  --max-questions 1000000
-stage_end 1 "${TOTAL_STAGES}" "Prepare full converted data"
+stage_begin 1 "${TOTAL_STAGES}" "Prepare memory facts and QA"
+if [[ "${SOURCE_DIR}" == "DEMO" ]]; then
+  python examples/prepare_profile_centric_data.py \
+    --demo \
+    --out-dir "${OUT_ROOT}/data_full"
+else
+  python examples/prepare_profile_centric_data.py \
+    --source-dir "${SOURCE_DIR}" \
+    --out-dir "${OUT_ROOT}/data_full" \
+    --max-memory 1000000 \
+    --max-questions 1000000
+fi
+stage_end 1 "${TOTAL_STAGES}" "Prepare memory facts and QA"
 
-FULL_MEMORY="${OUT_ROOT}/data_full/locomo_memory_facts.jsonl"
-FULL_QUESTIONS="${OUT_ROOT}/data_full/locomo_questions.jsonl"
-USED_MEMORY="${OUT_ROOT}/data_used/locomo_memory_facts.jsonl"
-USED_QUESTIONS="${OUT_ROOT}/data_used/locomo_questions.jsonl"
+FULL_MEMORY="${OUT_ROOT}/data_full/memory_facts.jsonl"
+FULL_QUESTIONS="${OUT_ROOT}/data_full/questions.jsonl"
+USED_MEMORY="${OUT_ROOT}/data_used/memory_facts.jsonl"
+USED_QUESTIONS="${OUT_ROOT}/data_used/questions.jsonl"
 
 stage_begin 2 "${TOTAL_STAGES}" "Select data fraction"
 python - <<PY
@@ -130,14 +134,14 @@ print(json.dumps(report, ensure_ascii=False, indent=2))
 PY
 stage_end 2 "${TOTAL_STAGES}" "Select data fraction"
 
-stage_begin 3 "${TOTAL_STAGES}" "Train utility and evaluate profile-centric retrieval"
+stage_begin 3 "${TOTAL_STAGES}" "Build profile hypergraph, train reward utility, embed/rank/retrieve, evaluate accuracy"
 python examples/profile_centric_hypergraph_eval.py \
   --memory-json "${USED_MEMORY}" \
   --questions-json "${USED_QUESTIONS}" \
   --train-ratio "${TRAIN_RATIO}" \
   --online-eval \
   --output-dir "${OUT_ROOT}/eval"
-stage_end 3 "${TOTAL_STAGES}" "Train utility and evaluate profile-centric retrieval"
+stage_end 3 "${TOTAL_STAGES}" "Build profile hypergraph, train reward utility, embed/rank/retrieve, evaluate accuracy"
 
 PIPELINE_END=$(date +%s)
 PIPELINE_ELAPSED=$(( PIPELINE_END - PIPELINE_START ))
@@ -145,9 +149,9 @@ PIPELINE_ELAPSED=$(( PIPELINE_END - PIPELINE_START ))
 echo "=============================================================================="
 echo "Finished at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Total elapsed: ${PIPELINE_ELAPSED}s"
-echo "Log file   : ${LOG_FILE}"
-echo "Data report: ${OUT_ROOT}/data_report.json"
-echo "Summary CSV: ${OUT_ROOT}/eval/profile_centric_summary.csv"
+echo "Log file    : ${LOG_FILE}"
+echo "Data report : ${OUT_ROOT}/data_report.json"
+echo "Summary CSV : ${OUT_ROOT}/eval/profile_centric_summary.csv"
 echo "Summary JSON: ${OUT_ROOT}/eval/profile_centric_summary.json"
 echo "=============================================================================="
 cat "${OUT_ROOT}/eval/profile_centric_summary.csv"
