@@ -92,7 +92,7 @@ class EnglishLLMFeatureClient:
         self.max_features_per_fact = max_features_per_fact
         self.max_tokens = max_tokens
         self.cache = JsonLLMCache(cache_dir=cache_dir, enabled=use_cache)
-        self.prompt_version = "english_open_profile_induction_v4"
+        self.prompt_version = "english_open_profile_induction_v5"
 
     def induce(self, facts: Sequence[ProfileFact], existing_edges: Sequence[ProfileHyperedgeUnit]) -> List[LLMFeature]:
         valid_ids = {fact.fact_id for fact in facts}
@@ -119,6 +119,8 @@ class EnglishLLMFeatureClient:
                 "max_features": self.max_features,
                 "max_features_per_fact": self.max_features_per_fact,
                 "allow_multi_membership": True,
+                "target_fact_coverage_ratio": 0.80,
+                "target_multi_membership_ratio": 0.25,
             },
             "example_profile_dimensions": EXAMPLE_PROFILE_DIMENSIONS,
         }
@@ -126,14 +128,11 @@ class EnglishLLMFeatureClient:
         cached = self.cache.get(cache_key)
         if cached is None:
             prompt = self._build_induction_prompt(payload)
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
-            raw = response.choices[0].message.content or ""
-            data = _safe_json(raw)
+            data, raw = self._call_json(prompt, max_tokens=self.max_tokens, temperature=self.temperature)
+            features = self._parse_features(data, valid_ids)
+            if not features:
+                repair_prompt = self._build_repair_prompt(payload, raw)
+                data, raw = self._call_json(repair_prompt, max_tokens=self.max_tokens, temperature=0.0)
             cached = {"raw": raw, "parsed": data}
             self.cache.set(cache_key, cached)
         data = cached.get("parsed") or {}
@@ -167,18 +166,21 @@ class EnglishLLMFeatureClient:
                 "{\"merge_groups\":[[\"edge_id_a\",\"edge_id_b\"]]}.\n\n"
                 f"Input JSON:\n{json.dumps(payload, ensure_ascii=False)}"
             )
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=min(self.max_tokens, 2048),
-            )
-            raw = response.choices[0].message.content or ""
-            data = _safe_json(raw)
+            data, raw = self._call_json(prompt, max_tokens=min(self.max_tokens, 2048), temperature=0.0)
             cached = {"raw": raw, "parsed": data}
             self.cache.set(cache_key, cached)
         data = cached.get("parsed") or {}
         return [group for group in data.get("merge_groups", []) if isinstance(group, list) and len(group) >= 2]
+
+    def _call_json(self, prompt: str, max_tokens: int, temperature: float) -> tuple[Dict[str, Any], str]:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        raw = response.choices[0].message.content or ""
+        return _safe_json(raw), raw
 
     def _build_induction_prompt(self, payload: Dict[str, Any]) -> str:
         return (
@@ -194,13 +196,33 @@ class EnglishLLMFeatureClient:
             "creative_self_expression, single_parent_adoption_planning, conflict_avoidance_tendency, or health_advocacy_activity. "
             "Avoid overly broad feature names or types such as research, time, emotion, tool, goal, preference, state, misc, or other. "
             "Each feature must have a clear boundary using positive_triggers and negative_triggers. "
+            "Coverage requirement: assign at least 80% of current batch facts to one or more features unless a fact is truly unprofiled. "
+            "Multi-membership requirement: when a fact expresses multiple user aspects, assign it to 2-3 relevant features. "
+            "Reuse requirement: if a current-batch fact matches an existing feature, include that existing edge_id as feature_id and assign the fact to it. "
+            "Creation requirement: if a fact does not match existing features, create a specific new feature. "
+            "Return between 4 and max_features features when the batch contains enough profile signals. "
             "Prefer features supported by at least two facts, but allow a singleton feature when it is a specific and important profile signal. "
-            "If a new feature matches an existing feature, reuse the existing edge_id as feature_id; otherwise create a new id.\n\n"
+            "Never return an empty features array unless there are no user-profile signals in the entire batch.\n\n"
             "Return strict JSON only in this schema:\n"
             "{\"features\":[{\"feature_id\":\"new_or_existing_id\",\"feature_name\":\"specific English common feature\","
             "\"feature_type\":\"open_ended_snake_case_type\",\"description\":\"English boundary description\","
             "\"positive_triggers\":[\"English trigger\"],\"negative_triggers\":[\"English exclusion\"],"
             "\"assigned_fact_ids\":[\"fact_id\"],\"confidence\":0.75}]}\n\n"
+            f"Input JSON:\n{json.dumps(payload, ensure_ascii=False)}"
+        )
+
+    def _build_repair_prompt(self, payload: Dict[str, Any], previous_raw: str) -> str:
+        return (
+            "The previous response produced no valid features, but this batch should be processed. "
+            "Regenerate strict JSON only. You must induce open-set user-profile features from the current batch. "
+            "Reuse existing edge_id values when the batch facts fit existing features; otherwise create new feature_id values. "
+            "Cover at least 80% of facts when possible. Allow multi-membership. Do not return an empty features array.\n\n"
+            "Required schema:\n"
+            "{\"features\":[{\"feature_id\":\"new_or_existing_id\",\"feature_name\":\"specific English common feature\","
+            "\"feature_type\":\"open_ended_snake_case_type\",\"description\":\"English boundary description\","
+            "\"positive_triggers\":[\"English trigger\"],\"negative_triggers\":[\"English exclusion\"],"
+            "\"assigned_fact_ids\":[\"fact_id\"],\"confidence\":0.75}]}\n\n"
+            f"Previous raw response:\n{previous_raw[:2000]}\n\n"
             f"Input JSON:\n{json.dumps(payload, ensure_ascii=False)}"
         )
 
