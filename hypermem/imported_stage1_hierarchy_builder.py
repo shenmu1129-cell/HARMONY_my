@@ -1,9 +1,9 @@
 """Reuse official HyperMem Stage-1 episode outputs when available.
 
-This wrapper keeps the public hierarchy-builder API unchanged. If an official
-Stage-1 episodes directory is available, it skips episode extraction and starts
-from topic aggregation + fact extraction. Otherwise it falls back to the local
-DeepSeek HyperMem-style builder.
+If an official Stage-1 episodes directory is available, this wrapper skips local
+episode extraction and starts from topic aggregation + fact extraction. For smoke
+tests it limits imported episodes to the number of requested input rows unless
+HYPERMEM_MAX_IMPORTED_EPISODES is explicitly set.
 """
 
 from __future__ import annotations
@@ -23,17 +23,25 @@ save_hierarchy_outputs = base.save_hierarchy_outputs
 HyperMemStyleHierarchyClient = base.HyperMemStyleHierarchyClient
 
 
+def _as_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x) for x in value if str(x).strip()]
+    if isinstance(value, tuple):
+        return [str(x) for x in value if str(x).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
 def _candidate_episode_dirs() -> List[Path]:
-    env_paths = [
-        os.getenv("HYPERMEM_STAGE1_EPISODES_DIR"),
-        os.getenv("HYPERMEM_IMPORTED_EPISODES_DIR"),
-    ]
     exp = os.getenv("HYPERMEM_EXPERIMENT_NAME", DEFAULT_EXPERIMENT)
     cwd = Path.cwd()
     candidates: List[Path] = []
-    for p in env_paths:
-        if p:
-            candidates.append(Path(p).expanduser())
+    for key in ["HYPERMEM_STAGE1_EPISODES_DIR", "HYPERMEM_IMPORTED_EPISODES_DIR"]:
+        value = os.getenv(key)
+        if value:
+            candidates.append(Path(value).expanduser())
     candidates.extend(
         [
             cwd / "results" / exp / "episodes",
@@ -46,18 +54,16 @@ def _candidate_episode_dirs() -> List[Path]:
     unique: List[Path] = []
     seen = set()
     for p in candidates:
-        key = str(p)
-        if key not in seen:
+        k = str(p)
+        if k not in seen:
             unique.append(p)
-            seen.add(key)
+            seen.add(k)
     return unique
 
 
 def find_imported_episode_dir() -> Path | None:
     for d in _candidate_episode_dirs():
-        if not d.exists() or not d.is_dir():
-            continue
-        if (d / "episode_list_all.json").exists() or list(d.glob("episode_list_conv_*.json")):
+        if d.exists() and d.is_dir() and ((d / "episode_list_all.json").exists() or list(d.glob("episode_list_conv_*.json"))):
             return d
     return None
 
@@ -73,9 +79,9 @@ def _looks_like_episode(obj: Any) -> bool:
     if not isinstance(obj, dict):
         return False
     keys = set(obj.keys())
-    return bool(
-        keys & {"episode_id", "id", "subject", "title", "summary", "episode", "episode_description", "content"}
-    ) and not ("episodes" in obj and isinstance(obj.get("episodes"), list))
+    return bool(keys & {"episode_id", "id", "subject", "title", "summary", "episode", "episode_description", "content"}) and not (
+        "episodes" in obj and isinstance(obj.get("episodes"), list)
+    )
 
 
 def _collect_episode_dicts(obj: Any) -> List[Dict[str, Any]]:
@@ -93,50 +99,10 @@ def _collect_episode_dicts(obj: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def _load_imported_episodes(directory: Path, max_episodes: int = 0) -> List[Dict[str, Any]]:
-    raw: List[Dict[str, Any]] = []
-    all_file = directory / "episode_list_all.json"
-    if all_file.exists():
-        raw.extend(_collect_episode_dicts(_read_json(all_file)))
-    if not raw:
-        for path in sorted(directory.glob("episode_list_conv_*.json")):
-            raw.extend(_collect_episode_dicts(_read_json(path)))
-    episodes: List[Dict[str, Any]] = []
-    seen = set()
-    for i, item in enumerate(raw):
-        ep = _normalize_imported_episode(item, i)
-        key = (ep.get("title"), ep.get("summary"), tuple(ep.get("source_row_ids", [])))
-        if key in seen:
-            continue
-        seen.add(key)
-        ep["episode_id"] = f"episode_{len(episodes) + 1:05d}"
-        episodes.append(ep)
-        if max_episodes and len(episodes) >= max_episodes:
-            break
-    return episodes
-
-
-def _as_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(x) for x in value if str(x).strip()]
-    if isinstance(value, tuple):
-        return [str(x) for x in value if str(x).strip()]
-    text = str(value).strip()
-    return [text] if text else []
-
-
 def _normalize_imported_episode(item: Dict[str, Any], index: int) -> Dict[str, Any]:
     title = str(item.get("title") or item.get("subject") or item.get("topic") or f"Imported episode {index + 1}")
     summary = str(item.get("summary") or item.get("episode_summary") or item.get("content") or item.get("episode") or title)
-    content = str(
-        item.get("content")
-        or item.get("episode")
-        or item.get("episode_description")
-        or item.get("text")
-        or summary
-    )
+    content = str(item.get("content") or item.get("episode") or item.get("episode_description") or item.get("text") or summary)
     source_ids = (
         _as_list(item.get("source_row_ids"))
         or _as_list(item.get("memory_ids"))
@@ -164,45 +130,72 @@ def _normalize_imported_episode(item: Dict[str, Any], index: int) -> Dict[str, A
     }
 
 
-def _build_from_imported_episodes(
-    rows: Sequence[Any],
-    episodes: List[Dict[str, Any]],
-    *,
-    show_progress: bool = True,
-) -> Dict[str, Any]:
+def _load_imported_episodes(directory: Path, max_episodes: int = 0) -> List[Dict[str, Any]]:
+    raw: List[Dict[str, Any]] = []
+    all_file = directory / "episode_list_all.json"
+    if all_file.exists():
+        raw.extend(_collect_episode_dicts(_read_json(all_file)))
+    if not raw:
+        for path in sorted(directory.glob("episode_list_conv_*.json")):
+            raw.extend(_collect_episode_dicts(_read_json(path)))
+    episodes: List[Dict[str, Any]] = []
+    seen = set()
+    for i, item in enumerate(raw):
+        ep = _normalize_imported_episode(item, i)
+        key = (ep.get("title"), ep.get("summary"), tuple(ep.get("source_row_ids", [])))
+        if key in seen:
+            continue
+        seen.add(key)
+        ep["episode_id"] = f"episode_{len(episodes) + 1:05d}"
+        episodes.append(ep)
+        if max_episodes and len(episodes) >= max_episodes:
+            break
+    return episodes
+
+
+def _resolve_import_limit(num_input_rows: int) -> int:
+    raw = os.getenv("HYPERMEM_MAX_IMPORTED_EPISODES")
+    if raw:
+        try:
+            value = int(raw)
+            return max(0, value)
+        except Exception:
+            pass
+    # Smoke-test default: respect --max-memory indirectly, because the public
+    # API receives already-sliced rows from build_behavioral_hybrid_memory.py.
+    return max(0, num_input_rows)
+
+
+def _build_from_imported_episodes(rows: Sequence[Any], episodes: List[Dict[str, Any]], *, show_progress: bool = True) -> Dict[str, Any]:
     normalized = normalize_input_rows(rows)
     client = HyperMemStyleHierarchyClient()
-
     topics: List[Dict[str, Any]] = []
     topic_map: Dict[str, Dict[str, Any]] = {}
+
     for i, episode in enumerate(episodes):
         if show_progress:
             print(f"[hierarchy] imported-stage1 topic episode={i + 1}/{len(episodes)} active_topics={len(topics)}", flush=True)
         if not topics:
             topic_id = f"topic_{len(topics) + 1:05d}"
-            data = client.create_topic([episode], len(topics))
-            topic = base._new_topic_from_response(data, topic_id, episode)
+            topic = base._new_topic_from_response(client.create_topic([episode], len(topics)), topic_id, episode)
             topics.append(topic)
             topic_map[topic_id] = topic
             continue
         matched_ids = client.match_topics(episode, topics)
         if not matched_ids:
             topic_id = f"topic_{len(topics) + 1:05d}"
-            data = client.create_topic([episode], len(topics))
-            topic = base._new_topic_from_response(data, topic_id, episode)
+            topic = base._new_topic_from_response(client.create_topic([episode], len(topics)), topic_id, episode)
             topics.append(topic)
             topic_map[topic_id] = topic
         else:
             for tid in matched_ids:
                 topic = topic_map[tid]
-                data = client.update_topic(topic, episode)
-                base._update_topic_in_place(topic, data, episode)
+                base._update_topic_in_place(topic, client.update_topic(topic, episode), episode)
 
     episode_hyperedges: Dict[str, Dict[str, Any]] = {}
     for topic in topics:
         topic_episodes = topic.get("episodes", [])
-        data = client.assign_episode_roles(topic, topic_episodes)
-        relation, weights, coherence = base._parse_episode_roles(data, topic_episodes)
+        relation, weights, coherence = base._parse_episode_roles(client.assign_episode_roles(topic, topic_episodes), topic_episodes)
         edge_id = f"episode_hyperedge_{topic['topic_id']}"
         episode_hyperedges[edge_id] = {
             "id": edge_id,
@@ -246,8 +239,7 @@ def _build_from_imported_episodes(
                 }
                 topic_facts.append(fact)
                 all_facts.append(fact)
-        role_data = client.assign_fact_roles(topic, topic_facts)
-        fact_roles, fact_weights, extraction_confidence = base._parse_fact_roles(role_data, topic_facts)
+        fact_roles, fact_weights, extraction_confidence = base._parse_fact_roles(client.assign_fact_roles(topic, topic_facts), topic_facts)
         for fact in topic_facts:
             fact["role"] = fact_roles.get(fact["fact_id"], "detail")
             fact["weight"] = fact_weights.get(fact["fact_id"], 0.5)
@@ -278,12 +270,18 @@ def extract_topic_episode_fact_hierarchy(
     use_llm: bool = True,
     show_progress: bool = True,
 ) -> Dict[str, Any]:
+    normalized = normalize_input_rows(rows)
     if use_llm:
         episode_dir = find_imported_episode_dir()
         if episode_dir is not None:
-            episodes = _load_imported_episodes(episode_dir, max_episodes=0)
+            max_episodes = _resolve_import_limit(len(normalized))
+            episodes = _load_imported_episodes(episode_dir, max_episodes=max_episodes)
             if episodes:
                 if show_progress:
-                    print(f"[hierarchy] using imported official Stage-1 episodes: {episode_dir} count={len(episodes)}", flush=True)
-                return _build_from_imported_episodes(rows, episodes, show_progress=show_progress)
-    return base.extract_topic_episode_fact_hierarchy(rows, batch_size=batch_size, use_llm=use_llm, show_progress=show_progress)
+                    print(
+                        f"[hierarchy] using imported official Stage-1 episodes: {episode_dir} "
+                        f"count={len(episodes)} limit={max_episodes or 'all'}",
+                        flush=True,
+                    )
+                return _build_from_imported_episodes(normalized, episodes, show_progress=show_progress)
+    return base.extract_topic_episode_fact_hierarchy(normalized, batch_size=batch_size, use_llm=use_llm, show_progress=show_progress)
