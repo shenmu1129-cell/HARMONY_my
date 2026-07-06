@@ -1,64 +1,77 @@
 # Profile-Centric Hypergraph Memory
 
-这是当前新增的主线：不再把 `Topic -> Episode -> Fact` 作为主检索路径，而是改成：
+当前仓库只保留这一条主线：`User Profile Hyperedge -> Fact`。
+
+完整流水线：
 
 ```text
-Conversation / Memory Facts
-        ↓
-User Profile Hyperedges
-        ↓
-Reward-guided Hyperedge Utility Learning
-        ↓
-Profile Hyperedge Retrieval
-        ↓
-Fact Evidence Selection
+Memory Facts
+  ↓
+Construct User Profile Hyperedges
+  ↓
+Build Local Hashed Embeddings
+  ↓
+Train Reward-guided Hyperedge Utility
+  ↓
+Rank Profile Hyperedges
+  ↓
+Rank Facts inside Selected Hyperedges
+  ↓
+Evaluate Accuracy / Recall / Tokens / Reward
 ```
 
-也就是：
+## 核心设计
+
+用户画像超边不是普通标签，而是一个高阶记忆单元：
 
 ```text
-Query -> User Profile Hyperedge -> Fact -> Answer
+profile_hyperedge = {
+  edge_type,
+  summary,
+  member_facts,
+  embedding,
+  freshness_score,
+  stability_score,
+  confidence_score,
+  utility_score,
+  hit_count,
+  failure_count
+}
 ```
 
-## 和 HyperMem 的区别
+其中：
 
-| 维度 | HyperMem | Profile-Centric HG |
-|---|---|---|
-| 主索引 | Topic / Episode | User Profile Hyperedge |
-| 底层证据 | Fact | Fact |
-| 检索路径 | Topic -> Episode -> Fact | Profile Hyperedge -> Fact |
-| 超边含义 | 组织 topic/episode/fact 的结构关系 | 表示用户画像单元 |
-| 学习机制 | 结构基本静态 | reward-guided utility update |
+- `embedding`：当前用本地 hashed embedding + cosine，相当于无需 GPU/API 的向量检索版本。
+- `utility_score`：轻量 bandit-style reward update 学出来的超边价值。
+- `member_facts`：最终进入 prompt 的底层证据。
 
-每条用户画像超边包含：
+检索时：
 
 ```text
-edge_type
-summary
-member_facts
-keywords / embedding proxy
-freshness_score
-stability_score
-confidence_score
-utility_score
-hit_count / failure_count
+query embedding
+  ↓
+profile hyperedge ranking = embedding similarity + utility + freshness + stability + type match - token cost
+  ↓
+fact ranking inside selected hyperedges
+  ↓
+selected evidence
 ```
 
-其中 `utility_score` 是轻量 bandit-style reward update 学出来的，不需要训练大模型。
-
-## 新增代码
-
-```text
-hypermem/profile_centric_hypergraph.py
-examples/profile_centric_hypergraph_eval.py
-scripts/run_profile_centric_hypergraph.sh
-```
-
-## 一键运行
+## 运行 demo
 
 ```bash
 conda activate wwt_hyperMem
 
+bash scripts/run_profile_centric_hypergraph.sh \
+  DEMO \
+  outputs/profile_centric_demo \
+  1.0 \
+  0.5
+```
+
+## 运行自己的数据
+
+```bash
 bash scripts/run_profile_centric_hypergraph.sh \
   /home/sutongtong/wwt/code \
   outputs/profile_centric_hg \
@@ -69,59 +82,40 @@ bash scripts/run_profile_centric_hypergraph.sh \
 参数含义：
 
 ```text
-/home/sutongtong/wwt/code      扫描数据来源
-outputs/profile_centric_hg     输出目录
-0.5                            使用 50% 数据
-0.5                            QA 中前 50% 用于 utility 训练，后 50% 用于测试
+第 1 个参数：数据来源目录；DEMO 表示内置小数据
+第 2 个参数：输出目录
+第 3 个参数：数据使用比例
+第 4 个参数：QA 训练比例
 ```
-
-## 输出
-
-```text
-outputs/profile_centric_hg/data_report.json
-outputs/profile_centric_hg/eval/profile_centric_summary.csv
-outputs/profile_centric_hg/eval/profile_centric_summary.json
-outputs/profile_centric_hg/eval/profile_centric_results.csv
-outputs/profile_centric_hg/eval/profile_centric_trace.jsonl
-outputs/profile_centric_hg/eval/profile_centric_trained_memory.json
-```
-
-默认会跑这些方法：
-
-```text
-profile_hg_embedding_only
-profile_hg_utility_train
-profile_hg_utility_frozen
-profile_hg_online_predict_then_update
-```
-
-重点看：
-
-```text
-profile_hg_embedding_only.hit / recall / tokens
-profile_hg_utility_frozen.hit / recall / tokens
-profile_hg_online_predict_then_update.hit / recall / tokens
-```
-
-如果 utility 版本优于 embedding-only，说明 reward-guided profile hyperedge utility 有正向作用。
 
 ## 单独运行 eval
 
 ```bash
 python examples/profile_centric_hypergraph_eval.py \
-  --memory-json data/my_memory_facts.jsonl \
-  --questions-json data/my_questions.jsonl \
+  --memory-json data/memory_facts.jsonl \
+  --questions-json data/questions.jsonl \
   --train-ratio 0.5 \
   --online-eval \
   --output-dir outputs/profile_centric_eval
 ```
 
-## 注意
-
-当前版本是 retrieval-only，不调用 LLM 生成答案，也不调用外部 embedding 服务。代码里的 lexical overlap 是本地 embedding proxy。正式实验时可以把相似度替换成真实 embedding，但整体流程保持不变：
+## 输出
 
 ```text
-embedding / BM25 负责候选召回
-profile hyperedge utility 负责个性化价值排序
-facts 负责最终证据
+profile_centric_results.csv
+profile_centric_summary.csv
+profile_centric_summary.json
+profile_centric_trace.jsonl
+profile_centric_trained_memory.json
 ```
+
+summary 里重点看这些方法：
+
+```text
+embedding_only_profile_hg
+reward_utility_train
+reward_utility_frozen_test
+online_predict_then_update_test
+```
+
+其中 `reward_utility_frozen_test` 是主测试结果，测试阶段冻结训练得到的 utility；`online_predict_then_update_test` 是在线评估，每个测试问题先计分再更新。
