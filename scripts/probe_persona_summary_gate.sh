@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GRAPH=${GRAPH:-outputs/persona_chat_cost_aware/persona_chat/graph_50/behavioral_hybrid_graph.json}
-SUM=${SUM:-outputs/persona_chat_cost_aware/persona_chat/graph_50/summary_hypernodes.json}
-Q=${Q:-outputs/persona_chat_cost_aware/persona_chat/data/questions.jsonl}
-OUT=${OUT:-outputs/persona_chat_cost_aware/persona_chat/summary_gate_probe}
-MAXQ=${MAXQ:-1000}
+export GRAPH=${GRAPH:-outputs/persona_chat_cost_aware/persona_chat/graph_50/behavioral_hybrid_graph.json}
+export SUM=${SUM:-outputs/persona_chat_cost_aware/persona_chat/graph_50/summary_hypernodes.json}
+export Q=${Q:-outputs/persona_chat_cost_aware/persona_chat/data/questions.jsonl}
+export OUT=${OUT:-outputs/persona_chat_cost_aware/persona_chat/summary_gate_probe}
+export MAXQ=${MAXQ:-1000}
 mkdir -p "$OUT"
 
 python -m py_compile hypermem/summary_gate_retrieval.py
@@ -21,10 +21,10 @@ from hypermem.summary_hypernodes import load_summary_hypernodes, retrieve_summar
 from hypermem.summary_gate_retrieval import retrieve_summary_gate
 from hypermem.cost_aware_retrieval import retrieve_budget_aware
 
-graph=Path(os.environ.get('GRAPH'))
-sum_path=Path(os.environ.get('SUM'))
-q_path=Path(os.environ.get('Q'))
-out=Path(os.environ.get('OUT'))
+graph=Path(os.environ['GRAPH'])
+sum_path=Path(os.environ['SUM'])
+q_path=Path(os.environ['Q'])
+out=Path(os.environ['OUT'])
 maxq=int(os.environ.get('MAXQ','1000'))
 mem=ProfileCentricHypergraphMemory.load(graph)
 sums=load_summary_hypernodes(sum_path)
