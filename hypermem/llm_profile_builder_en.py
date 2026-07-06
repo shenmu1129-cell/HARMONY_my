@@ -44,9 +44,8 @@ EXAMPLE_PROFILE_DIMENSIONS = [
 ]
 
 
-# Only map a few very clear engineering/research categories. Most LLM-induced
-# profile features should remain AUTO_DISCOVERED so the open-set feature itself
-# is the semantic definition of the hyperedge.
+# Exact compatibility mapping only. Do not infer coarse edge_type from free-form
+# feature names/descriptions; the open-set feature itself is the semantic label.
 EXACT_FEATURE_TYPE_TO_EDGE_TYPE = {
     "tool_or_workflow": ProfileEdgeType.TOOL_USAGE,
     "domain_knowledge": ProfileEdgeType.DOMAIN_KNOWLEDGE,
@@ -62,22 +61,9 @@ def _normalize_feature_type(feature_type: str) -> str:
 
 
 def _edge_type_en(feature_type: str, name: str, desc: str) -> ProfileEdgeType:
+    del name, desc
     normalized_type = _normalize_feature_type(feature_type)
-    if normalized_type in EXACT_FEATURE_TYPE_TO_EDGE_TYPE:
-        return EXACT_FEATURE_TYPE_TO_EDGE_TYPE[normalized_type]
-
-    text = " ".join([normalized_type, name, desc]).lower()
-    if any(x in text for x in ["tool workflow", "tool_or_workflow", "github", "server", "script", "conda", "codex"]):
-        return ProfileEdgeType.TOOL_USAGE
-    if any(x in text for x in ["domain knowledge", "domain_knowledge", "algorithm", "rag", "hypergraph", "locomo"]):
-        return ProfileEdgeType.DOMAIN_KNOWLEDGE
-    if any(x in text for x in ["research focus", "research_focus", "paper topic", "research direction"]):
-        return ProfileEdgeType.RESEARCH_FOCUS
-    if any(x in text for x in ["writing style", "writing_or_reporting_style", "paper writing", "report writing"]):
-        return ProfileEdgeType.WRITING_STYLE
-    if any(x in text for x in ["temporal update", "temporal_update", "life event", "recent update", "timeline"]):
-        return ProfileEdgeType.TEMPORAL_EVOLUTION
-    return ProfileEdgeType.AUTO_DISCOVERED
+    return EXACT_FEATURE_TYPE_TO_EDGE_TYPE.get(normalized_type, ProfileEdgeType.AUTO_DISCOVERED)
 
 
 class EnglishLLMFeatureClient:
@@ -106,7 +92,7 @@ class EnglishLLMFeatureClient:
         self.max_features_per_fact = max_features_per_fact
         self.max_tokens = max_tokens
         self.cache = JsonLLMCache(cache_dir=cache_dir, enabled=use_cache)
-        self.prompt_version = "english_open_profile_induction_v3"
+        self.prompt_version = "english_open_profile_induction_v4"
 
     def induce(self, facts: Sequence[ProfileFact], existing_edges: Sequence[ProfileHyperedgeUnit]) -> List[LLMFeature]:
         valid_ids = {fact.fact_id for fact in facts}
