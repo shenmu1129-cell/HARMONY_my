@@ -1,4 +1,9 @@
-"""Evaluate a saved graph as reward-guided behavioral-profile memory."""
+"""Evaluate a saved graph as reward-guided behavioral-profile memory.
+
+Retrieval is still behavioral-hyperedge first: query -> profile hyperedges -> member facts.
+The router only decides whether selected behavioral edges should receive reward
+updates. Episodic/detail queries should not punish long-term behavioral edges.
+"""
 
 from __future__ import annotations
 
@@ -14,8 +19,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from examples import profile_centric_hypergraph_eval as base_eval  # noqa: E402
-from hypermem.behavioral_profile import behavioral_profile_summary, write_behavioral_pool  # noqa: E402
+from hypermem.behavioral_profile import (  # noqa: E402
+    behavioral_profile_summary,
+    update_behavioral_edges_from_feedback,
+    write_behavioral_pool,
+)
 from hypermem.profile_centric_hypergraph import ProfileCentricHypergraphMemory  # noqa: E402
+from hypermem.query_router import route_query, route_to_dict  # noqa: E402
 
 
 def load_questions(path: str, max_questions: int = 0) -> List[Dict[str, Any]]:
@@ -33,6 +43,67 @@ def write_rows(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def run_behavioral_questions(
+    memory: ProfileCentricHypergraphMemory,
+    questions: Sequence[Dict[str, Any]],
+    args: argparse.Namespace,
+    method: str,
+    *,
+    use_utility: bool,
+    update: bool,
+    trace_file,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    started = base_eval.log_method_start(method, len(questions))
+    iterator = base_eval.progress(questions, total=len(questions), desc=f"[qa] {method}", enabled=not args.no_progress)
+    for idx, q in enumerate(iterator, start=1):
+        route = route_query(q["question"])
+        # Retrieval still uses behavioral hyperedges first; fallback acts as the
+        # detail/fact path when the selected hyperedges are insufficient.
+        result = memory.retrieve(
+            q["question"],
+            top_k_edges=args.top_k_edges,
+            top_k_facts=args.top_k_facts,
+            max_tokens=args.max_tokens,
+            use_utility=use_utility,
+            fallback=not args.no_fallback,
+            sufficiency_threshold=args.sufficiency_threshold,
+        )
+        row, reward, hit, _ = base_eval.row_from_result(method, q, result, update_used=update and route.update_behavioral_edges)
+        route_dict = route_to_dict(route)
+        row.update(route_dict)
+        rows.append(row)
+        if update:
+            update_behavioral_edges_from_feedback(
+                memory,
+                result.selected_edges,
+                reward=reward,
+                hit=bool(hit),
+                route=route.route,
+                learning_rate=args.learning_rate,
+                allow_deactivate=args.allow_deactivate,
+            )
+        trace_file.write(json.dumps({
+            **row,
+            "gold": q["gold"],
+            "edge_debug": result.debug_scores,
+            "evidence": [fact.content for fact in result.selected_facts],
+        }, ensure_ascii=False) + "\n")
+        trace_file.flush()
+        if not args.no_progress and idx % 100 == 0:
+            print(f"[qa] {method} {idx}/{len(questions)}", flush=True)
+    base_eval.log_method_end(method, started, rows)
+    return rows
+
+
+def route_counts(rows: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        route = str(row.get("route", "unknown"))
+        counts[route] = counts.get(route, 0) + 1
+    return counts
+
+
 def run_eval(args: argparse.Namespace) -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -45,18 +116,18 @@ def run_eval(args: argparse.Namespace) -> None:
     with trace_path.open("w", encoding="utf-8") as trace:
         baseline_memory = ProfileCentricHypergraphMemory.load(args.memory_graph)
         baseline_memory.learning_rate = args.learning_rate
-        baseline_rows = base_eval.run_questions(
-            baseline_memory, test_q, args, "embedding_only_behavioral_profile", False, False, trace
+        baseline_rows = run_behavioral_questions(
+            baseline_memory, test_q, args, "embedding_only_behavioral_profile", use_utility=False, update=False, trace_file=trace
         )
         all_rows.extend(baseline_rows)
 
         learned_memory = ProfileCentricHypergraphMemory.load(args.memory_graph)
         learned_memory.learning_rate = args.learning_rate
-        train_rows = base_eval.run_questions(
-            learned_memory, train_q, args, "reward_guided_behavioral_train", True, True, trace
+        train_rows = run_behavioral_questions(
+            learned_memory, train_q, args, "reward_guided_behavioral_train", use_utility=True, update=True, trace_file=trace
         )
-        test_rows = base_eval.run_questions(
-            learned_memory, test_q, args, "reward_guided_behavioral_frozen_test", True, False, trace
+        test_rows = run_behavioral_questions(
+            learned_memory, test_q, args, "reward_guided_behavioral_frozen_test", use_utility=True, update=False, trace_file=trace
         )
         all_rows.extend(train_rows)
         all_rows.extend(test_rows)
@@ -79,17 +150,20 @@ def run_eval(args: argparse.Namespace) -> None:
     )
     summary = {
         "pipeline": [
-            "load_open_set_behavioral_profile_hyperedges",
-            "keep_episodic_detail_facts_in_base_memory_graph",
-            "train_reward_guided_hyperedge_utility_on_train_qa",
+            "load_post_hierarchy_open_set_behavioral_hyperedges",
+            "embed_query_and_behavioral_hyperedges",
+            "retrieve_behavioral_hyperedges_then_member_facts",
+            "route_query_for_reward_update_only",
+            "train_reward_guided_hyperedge_utility_on_behavioral_or_mixed_train_qa",
             "export_high_value_behavioral_memory_pool",
         ],
-        "design_note": "Only recurring, stable, or reward-useful dimensions are promoted to behavioral profile edges; ordinary details stay in the base fact/tree path.",
+        "design_note": "Retrieval is behavioral-hyperedge first. Query routing controls reward updates so episodic/detail questions do not deactivate behavioral profile hyperedges.",
         "memory_graph": args.memory_graph,
         "learning_rate": args.learning_rate,
         "num_questions": len(questions),
         "num_train_questions": len(train_q),
         "num_test_questions": len(test_q),
+        "route_counts": route_counts(all_rows),
         "methods": {method: base_eval.summarize(rows) for method, rows in by_method.items()},
         "behavioral_profile": behavioral_profile_summary(learned_memory, top_k=args.pool_top_k),
         "high_value_pool_size": len(pool),
@@ -119,6 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=450)
     parser.add_argument("--sufficiency-threshold", type=float, default=0.10)
     parser.add_argument("--learning-rate", type=float, default=0.18)
+    parser.add_argument("--allow-deactivate", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--no-fallback", action="store_true")
     parser.add_argument("--max-questions", type=int, default=0)
