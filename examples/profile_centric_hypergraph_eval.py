@@ -15,7 +15,13 @@ import csv
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any, Dict, List, Sequence, Tuple
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional at runtime.
+    tqdm = None  # type: ignore[assignment]
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -42,6 +48,24 @@ DEMO_QUESTIONS = [
     {"qid": "q4", "question": "我经常让你帮我做哪些工程操作？", "gold": ["服务器", "conda", "GitHub"], "category": "habit"},
     {"qid": "q5", "question": "强化学习版本最好先做哪种？", "gold": ["bandit", "reward update"], "category": "rl"},
 ]
+
+
+def progress(iterable, *, total: int, desc: str, enabled: bool):
+    if enabled and tqdm is not None:
+        return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True)
+    return iterable
+
+
+def log_method_start(method: str, n: int) -> float:
+    started = time.time()
+    print(f"[method] START {method} n={n} at={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    return started
+
+
+def log_method_end(method: str, started: float, rows: Sequence[Dict[str, Any]]) -> None:
+    elapsed = time.time() - started
+    avg = elapsed / max(1, len(rows))
+    print(f"[method] DONE  {method} n={len(rows)} elapsed={elapsed:.2f}s avg={avg:.4f}s/q", flush=True)
 
 
 def read_json_or_jsonl(path: Path) -> List[Any]:
@@ -126,7 +150,9 @@ def reward_from_result(hit: int, recall: float, tokens: int, fallback_used: bool
     return max(-1.0, min(1.0, recall + 0.20 * hit - 0.12 * tokens / 1000.0 - (0.04 if fallback_used else 0.0)))
 
 
-def build_memory(memory_rows: Sequence[Dict[str, Any]], args: argparse.Namespace) -> ProfileCentricHypergraphMemory:
+def build_memory(memory_rows: Sequence[Dict[str, Any]], args: argparse.Namespace, label: str) -> ProfileCentricHypergraphMemory:
+    started = time.time()
+    print(f"[build_memory] START {label} rows={len(memory_rows)}", flush=True)
     memory = ProfileCentricHypergraphMemory(
         user_id="profile_eval_user",
         attach_threshold=args.attach_threshold,
@@ -134,7 +160,17 @@ def build_memory(memory_rows: Sequence[Dict[str, Any]], args: argparse.Namespace
         learning_rate=args.learning_rate,
         embedding_dim=args.embedding_dim,
     )
-    memory.build_from_rows(memory_rows)
+    memory.build_from_rows(
+        memory_rows,
+        show_progress=not args.no_progress,
+        max_auto_edge_pairs=args.max_auto_edge_pairs,
+    )
+    exported = memory.export()
+    print(
+        f"[build_memory] DONE  {label} elapsed={time.time() - started:.2f}s "
+        f"facts={exported['num_facts']} edges={exported['num_edges']} active_edges={exported['active_edges']}",
+        flush=True,
+    )
     return memory
 
 
@@ -166,7 +202,10 @@ def row_from_result(method: str, q: Dict[str, Any], result: ProfileRetrievalResu
 
 def run_questions(memory: ProfileCentricHypergraphMemory, questions: Sequence[Dict[str, Any]], args: argparse.Namespace, method: str, use_utility: bool, update: bool, trace_file) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for q in questions:
+    started = log_method_start(method, len(questions))
+    iterator = progress(questions, total=len(questions), desc=f"[qa] {method}", enabled=not args.no_progress)
+    for idx, q in enumerate(iterator, start=1):
+        q_started = time.time()
         result = memory.retrieve(
             q["question"],
             top_k_edges=args.top_k_edges,
@@ -186,6 +225,14 @@ def run_questions(memory: ProfileCentricHypergraphMemory, questions: Sequence[Di
             "edge_debug": result.debug_scores,
             "evidence": [fact.content for fact in result.selected_facts],
         }, ensure_ascii=False) + "\n")
+        trace_file.flush()
+        if tqdm is not None and hasattr(iterator, "set_postfix"):
+            elapsed = time.time() - started
+            iterator.set_postfix(avg_s=f"{elapsed / max(1, idx):.3f}", last_s=f"{time.time() - q_started:.3f}", trace=idx)
+        elif not args.no_progress and idx % 100 == 0:
+            elapsed = time.time() - started
+            print(f"[qa] {method} {idx}/{len(questions)} avg={elapsed / max(1, idx):.4f}s/q", flush=True)
+    log_method_end(method, started, rows)
     return rows
 
 
@@ -236,21 +283,29 @@ def run_eval(args: argparse.Namespace) -> None:
     memory_rows, questions = load_inputs(args)
     train_q, test_q = split_questions(questions, args.train_ratio)
 
+    print(
+        "[eval] loaded "
+        f"memory_rows={len(memory_rows)} questions={len(questions)} "
+        f"train={len(train_q)} test={len(test_q)} online_eval={int(args.online_eval)} "
+        f"max_auto_edge_pairs={args.max_auto_edge_pairs}",
+        flush=True,
+    )
+
     all_rows: List[Dict[str, Any]] = []
     trace_path = out_dir / "profile_centric_trace.jsonl"
     with trace_path.open("w", encoding="utf-8") as trace:
-        embedding_memory = build_memory(memory_rows, args)
+        embedding_memory = build_memory(memory_rows, args, label="embedding_only_profile_hg")
         embedding_rows = run_questions(embedding_memory, test_q, args, "embedding_only_profile_hg", use_utility=False, update=False, trace_file=trace)
         all_rows.extend(embedding_rows)
 
-        utility_memory = build_memory(memory_rows, args)
+        utility_memory = build_memory(memory_rows, args, label="reward_utility")
         train_rows = run_questions(utility_memory, train_q, args, "reward_utility_train", use_utility=True, update=True, trace_file=trace)
         frozen_rows = run_questions(utility_memory, test_q, args, "reward_utility_frozen_test", use_utility=True, update=False, trace_file=trace)
         all_rows.extend(train_rows)
         all_rows.extend(frozen_rows)
 
         if args.online_eval:
-            online_memory = build_memory(memory_rows, args)
+            online_memory = build_memory(memory_rows, args, label="online_eval")
             _ = run_questions(online_memory, train_q, args, "online_warmup_train", use_utility=True, update=True, trace_file=trace)
             online_rows = run_questions(online_memory, test_q, args, "online_predict_then_update_test", use_utility=True, update=True, trace_file=trace)
             all_rows.extend(online_rows)
@@ -321,6 +376,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-dim", type=int, default=512)
     parser.add_argument("--attach-threshold", type=float, default=0.52)
     parser.add_argument("--discovery-threshold", type=float, default=0.55)
+    parser.add_argument("--max-auto-edge-pairs", type=int, default=0, help="Maximum auto-edge pair comparisons during discovery. Use 0 for unlimited.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm/progress logging.")
     parser.add_argument("--no-fallback", action="store_true")
     parser.add_argument("--max-memory", type=int, default=0)
     parser.add_argument("--max-questions", type=int, default=0)
