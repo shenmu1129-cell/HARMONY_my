@@ -1,4 +1,9 @@
-"""English LLM profile-feature induction for LoCoMo-style data."""
+"""English LLM profile-feature induction for LoCoMo-style data.
+
+The semantic hyperedge is defined by the LLM-induced feature_name,
+feature_type, description, triggers, and member facts. The coarse internal
+edge_type is only a backward-compatible implementation field.
+"""
 
 from __future__ import annotations
 
@@ -18,14 +23,14 @@ from hypermem.llm_profile_builder import (
 from hypermem.profile_centric_hypergraph import ProfileCentricHypergraphMemory, ProfileEdgeType, ProfileFact, ProfileHyperedgeUnit, clamp
 
 
-PROFILE_DIMENSIONS = [
+EXAMPLE_PROFILE_DIMENSIONS = [
     "identity_and_values",
-    "preference",
+    "preference_pattern",
     "habit_or_routine",
-    "relationship",
-    "family",
-    "work_or_study",
-    "health_and_wellbeing",
+    "relationship_dynamic",
+    "family_role",
+    "work_or_study_context",
+    "health_and_wellbeing_pattern",
     "life_event",
     "goal_or_plan",
     "emotion_or_current_state",
@@ -36,58 +41,42 @@ PROFILE_DIMENSIONS = [
     "domain_knowledge",
     "research_focus",
     "writing_or_reporting_style",
-    "other_specific_profile_feature",
 ]
 
 
+# Only map a few very clear engineering/research categories. Most LLM-induced
+# profile features should remain AUTO_DISCOVERED so the open-set feature itself
+# is the semantic definition of the hyperedge.
 EXACT_FEATURE_TYPE_TO_EDGE_TYPE = {
-    "identity_and_values": ProfileEdgeType.PREFERENCE,
-    "preference": ProfileEdgeType.PREFERENCE,
-    "habit_or_routine": ProfileEdgeType.HABIT,
-    "relationship": ProfileEdgeType.PREFERENCE,
-    "family": ProfileEdgeType.CURRENT_STATE,
-    "work_or_study": ProfileEdgeType.CURRENT_STATE,
-    "health_and_wellbeing": ProfileEdgeType.CURRENT_STATE,
-    "life_event": ProfileEdgeType.TEMPORAL_EVOLUTION,
-    "goal_or_plan": ProfileEdgeType.GOAL,
-    "emotion_or_current_state": ProfileEdgeType.CURRENT_STATE,
-    "communication_style": ProfileEdgeType.HABIT,
-    "activity_or_hobby": ProfileEdgeType.HABIT,
-    "temporal_update": ProfileEdgeType.TEMPORAL_EVOLUTION,
     "tool_or_workflow": ProfileEdgeType.TOOL_USAGE,
     "domain_knowledge": ProfileEdgeType.DOMAIN_KNOWLEDGE,
     "research_focus": ProfileEdgeType.RESEARCH_FOCUS,
     "writing_or_reporting_style": ProfileEdgeType.WRITING_STYLE,
+    "temporal_update": ProfileEdgeType.TEMPORAL_EVOLUTION,
+    "life_event": ProfileEdgeType.TEMPORAL_EVOLUTION,
 }
 
 
+def _normalize_feature_type(feature_type: str) -> str:
+    return feature_type.strip().lower().replace(" ", "_").replace("-", "_")
+
+
 def _edge_type_en(feature_type: str, name: str, desc: str) -> ProfileEdgeType:
-    normalized_type = feature_type.strip().lower().replace(" ", "_").replace("-", "_")
+    normalized_type = _normalize_feature_type(feature_type)
     if normalized_type in EXACT_FEATURE_TYPE_TO_EDGE_TYPE:
         return EXACT_FEATURE_TYPE_TO_EDGE_TYPE[normalized_type]
 
     text = " ".join([normalized_type, name, desc]).lower()
-    # Specific profile dimensions should take priority over loose word matches.
-    if any(x in text for x in ["communication style", "communication_style", "encouraging language", "supportive language"]):
-        return ProfileEdgeType.HABIT
-    if any(x in text for x in ["temporal", "temporal_update", "life event", "recent update", "timeline", "change over time"]):
-        return ProfileEdgeType.TEMPORAL_EVOLUTION
-    if any(x in text for x in ["writing style", "paper writing", "report writing", "presentation style"]):
-        return ProfileEdgeType.WRITING_STYLE
-    if any(x in text for x in ["research focus", "research topic", "paper topic"]):
-        return ProfileEdgeType.RESEARCH_FOCUS
-    if any(x in text for x in ["goal", "intention", "career aspiration", "publication goal"]):
-        return ProfileEdgeType.GOAL
-    if any(x in text for x in ["habit", "routine", "lifestyle", "activity", "hobby"]):
-        return ProfileEdgeType.HABIT
-    if any(x in text for x in ["preference", "likes", "dislikes", "values", "identity", "social trait", "empathy"]):
-        return ProfileEdgeType.PREFERENCE
-    if any(x in text for x in ["current state", "emotion", "wellbeing", "health", "family", "life state", "responsibility"]):
-        return ProfileEdgeType.CURRENT_STATE
-    if any(x in text for x in ["tool", "workflow", "github", "server", "script", "experiment"]):
+    if any(x in text for x in ["tool workflow", "tool_or_workflow", "github", "server", "script", "conda", "codex"]):
         return ProfileEdgeType.TOOL_USAGE
-    if any(x in text for x in ["domain knowledge", "algorithm", "rag", "hypergraph", "locomo"]):
+    if any(x in text for x in ["domain knowledge", "domain_knowledge", "algorithm", "rag", "hypergraph", "locomo"]):
         return ProfileEdgeType.DOMAIN_KNOWLEDGE
+    if any(x in text for x in ["research focus", "research_focus", "paper topic", "research direction"]):
+        return ProfileEdgeType.RESEARCH_FOCUS
+    if any(x in text for x in ["writing style", "writing_or_reporting_style", "paper writing", "report writing"]):
+        return ProfileEdgeType.WRITING_STYLE
+    if any(x in text for x in ["temporal update", "temporal_update", "life event", "recent update", "timeline"]):
+        return ProfileEdgeType.TEMPORAL_EVOLUTION
     return ProfileEdgeType.AUTO_DISCOVERED
 
 
@@ -117,13 +106,13 @@ class EnglishLLMFeatureClient:
         self.max_features_per_fact = max_features_per_fact
         self.max_tokens = max_tokens
         self.cache = JsonLLMCache(cache_dir=cache_dir, enabled=use_cache)
-        self.prompt_version = "english_profile_induction_v2"
+        self.prompt_version = "english_open_profile_induction_v3"
 
     def induce(self, facts: Sequence[ProfileFact], existing_edges: Sequence[ProfileHyperedgeUnit]) -> List[LLMFeature]:
         valid_ids = {fact.fact_id for fact in facts}
         payload = {
             "prompt_version": self.prompt_version,
-            "task": "induce_profile_hyperedges",
+            "task": "open_set_profile_hyperedge_induction",
             "model": self.model,
             "facts": [
                 {"fact_id": fact.fact_id, "content": fact.content[:900], "keywords": fact.keywords[:8]}
@@ -145,7 +134,7 @@ class EnglishLLMFeatureClient:
                 "max_features_per_fact": self.max_features_per_fact,
                 "allow_multi_membership": True,
             },
-            "allowed_profile_dimensions": PROFILE_DIMENSIONS,
+            "example_profile_dimensions": EXAMPLE_PROFILE_DIMENSIONS,
         }
         cache_key = self.cache.make_key(payload)
         cached = self.cache.get(cache_key)
@@ -187,7 +176,7 @@ class EnglishLLMFeatureClient:
         cached = self.cache.get(cache_key)
         if cached is None:
             prompt = (
-                "You maintain a profile-centric memory hypergraph. Find features that are semantically duplicate "
+                "You maintain an open-set profile-centric memory hypergraph. Find features that are semantically duplicate "
                 "or whose boundaries strongly overlap. Return strict JSON only: "
                 "{\"merge_groups\":[[\"edge_id_a\",\"edge_id_b\"]]}.\n\n"
                 f"Input JSON:\n{json.dumps(payload, ensure_ascii=False)}"
@@ -208,19 +197,22 @@ class EnglishLLMFeatureClient:
     def _build_induction_prompt(self, payload: Dict[str, Any]) -> str:
         return (
             "You are building a long-term user-memory hypergraph for English conversational QA. "
-            "Given a batch of memory facts, induce shared user-profile features. Do not use fixed labels only; "
-            "create concrete, human-readable features from the facts. A single fact may belong to multiple features. "
-            "Prefer English feature names and English descriptions. Avoid overly broad names such as 'research', "
-            "'time', 'emotion', 'tool', 'goal', 'preference', 'state', 'misc', or 'other'. "
+            "Given a batch of memory facts, induce shared user-profile features. This is an open-set induction task, "
+            "not a closed-set classification task. Do not merely assign facts to predefined categories. "
+            "Create concrete, human-readable common features from the facts themselves. "
+            "A single fact may belong to multiple features when it expresses multiple user aspects. "
+            "Prefer English feature names and English descriptions. "
+            "Use feature_type as an open-ended, concise snake_case semantic label created by you. "
+            "The example_profile_dimensions are examples only; you may create a more specific feature_type whenever appropriate. "
+            "Good feature_type examples include caregiver_identity, community_belonging, emotional_support_pattern, "
+            "creative_self_expression, single_parent_adoption_planning, conflict_avoidance_tendency, or health_advocacy_activity. "
+            "Avoid overly broad feature names or types such as research, time, emotion, tool, goal, preference, state, misc, or other. "
             "Each feature must have a clear boundary using positive_triggers and negative_triggers. "
-            "If a new feature matches an existing feature, reuse the existing edge_id as feature_id; otherwise create a new id. "
-            "Use feature_type values close to these profile dimensions, not arbitrary broad labels: "
-            f"{', '.join(PROFILE_DIMENSIONS)}. "
-            "Use communication_style only for stable ways the user communicates, not for domain knowledge. "
-            "Use temporal_update or life_event for time-bounded plans/events, not goal_or_plan unless it is a persistent intention.\n\n"
+            "Prefer features supported by at least two facts, but allow a singleton feature when it is a specific and important profile signal. "
+            "If a new feature matches an existing feature, reuse the existing edge_id as feature_id; otherwise create a new id.\n\n"
             "Return strict JSON only in this schema:\n"
-            "{\"features\":[{\"feature_id\":\"new_or_existing_id\",\"feature_name\":\"specific English name\","
-            "\"feature_type\":\"profile_dimension\",\"description\":\"English boundary description\","
+            "{\"features\":[{\"feature_id\":\"new_or_existing_id\",\"feature_name\":\"specific English common feature\","
+            "\"feature_type\":\"open_ended_snake_case_type\",\"description\":\"English boundary description\","
             "\"positive_triggers\":[\"English trigger\"],\"negative_triggers\":[\"English exclusion\"],"
             "\"assigned_fact_ids\":[\"fact_id\"],\"confidence\":0.75}]}\n\n"
             f"Input JSON:\n{json.dumps(payload, ensure_ascii=False)}"
@@ -232,7 +224,7 @@ class EnglishLLMFeatureClient:
             if not isinstance(row, dict):
                 continue
             name = str(row.get("feature_name") or "").strip()
-            feature_type = str(row.get("feature_type") or "other_specific_profile_feature").strip()
+            feature_type = str(row.get("feature_type") or "open_profile_feature").strip()
             desc = str(row.get("description") or "").strip()
             assigned = [fact_id for fact_id in _dedupe(row.get("assigned_fact_ids") or []) if fact_id in valid_ids]
             if not name or not desc or not assigned:
