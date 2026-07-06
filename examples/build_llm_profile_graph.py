@@ -82,6 +82,25 @@ def edge_table(memory: ProfileCentricHypergraphMemory) -> List[Dict[str, Any]]:
     return sorted(rows, key=lambda row: row["num_facts"], reverse=True)
 
 
+def all_edge_table(memory: ProfileCentricHypergraphMemory) -> List[Dict[str, Any]]:
+    rows = []
+    for edge_id, edge in memory.edges.items():
+        meta = edge.metadata or {}
+        rows.append(
+            {
+                "edge_id": edge_id,
+                "status": edge.status,
+                "merged_into": meta.get("merged_into", ""),
+                "edge_type": edge.edge_type.value,
+                "feature_name": meta.get("feature_name", ""),
+                "feature_type": meta.get("feature_type", ""),
+                "num_facts": len(edge.member_fact_ids),
+                "description": meta.get("feature_description", ""),
+            }
+        )
+    return sorted(rows, key=lambda row: (row["status"] != "active", -row["num_facts"], row["edge_id"]))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--memory-json", required=True)
@@ -90,6 +109,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--canonical-threshold", type=float, default=0.72)
     parser.add_argument("--consolidate-every", type=int, default=4)
+    parser.add_argument("--llm-consolidation-rounds", type=int, default=0)
     parser.add_argument("--max-edge-facts", type=int, default=160)
     parser.add_argument("--max-features-per-batch", type=int, default=12)
     parser.add_argument("--max-features-per-fact", type=int, default=4)
@@ -110,6 +130,7 @@ def main() -> None:
         batch_size=args.batch_size,
         canonical_threshold=args.canonical_threshold,
         consolidate_every=args.consolidate_every,
+        llm_consolidation_rounds=args.llm_consolidation_rounds,
         max_edge_facts=args.max_edge_facts,
         max_features_per_batch=args.max_features_per_batch,
         max_features_per_fact=args.max_features_per_fact,
@@ -119,6 +140,7 @@ def main() -> None:
     graph_path = out_dir / "profile_graph.json"
     report_path = out_dir / "build_report.json"
     edges_path = out_dir / "active_edges.json"
+    all_edges_path = out_dir / "all_edges.json"
 
     memory.save(graph_path)
     report = {
@@ -132,11 +154,13 @@ def main() -> None:
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     edges_path.write_text(json.dumps(edge_table(memory), ensure_ascii=False, indent=2), encoding="utf-8")
+    all_edges_path.write_text(json.dumps(all_edge_table(memory), ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(json.dumps(report, ensure_ascii=False, indent=2))
     print("wrote:", graph_path)
     print("wrote:", report_path)
     print("wrote:", edges_path)
+    print("wrote:", all_edges_path)
 
 
 if __name__ == "__main__":
