@@ -142,10 +142,13 @@ for ROOT in ${DATASET_ROOTS}; do
 done
 
 COMBINED="${OUT_ROOT}/combined_cost_aware_summary.csv"
+SUMMARY_LIST="${OUT_ROOT}/summary_files.txt"
+printf "%s\n" "${SUMMARY_FILES[@]}" > "${SUMMARY_LIST}"
 python - <<PY
 from pathlib import Path
 import csv
-summary_files = [Path(x) for x in ${SUMMARY_FILES[@]+["${SUMMARY_FILES[*]}"][0].split()}]
+summary_list = Path("${SUMMARY_LIST}")
+summary_files = [Path(x.strip()) for x in summary_list.read_text(encoding="utf-8").splitlines() if x.strip()]
 out = Path("${COMBINED}")
 rows = []
 for path in summary_files:
@@ -154,8 +157,7 @@ for path in summary_files:
     dataset = path.parents[1].name
     with path.open(encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            row = {"dataset": dataset, **row}
-            rows.append(row)
+            rows.append({"dataset": dataset, **row})
 if rows:
     fields = []
     for row in rows:
