@@ -1,278 +1,109 @@
-# UP-HyperPool: Semi-Automatic User-Profile Hyperedge Pool
+# Profile-Centric Hypergraph Memory
 
-本仓库在 HyperMem 的 Topic / Episode / Fact 长期记忆底座之上，加入一个 **半自动用户画像超边池快速通道**。
+本仓库当前只保留一个主线：**基于用户画像超边的长期记忆检索**。
 
-核心思想：
-
-```text
-Topic / Episode / Fact base memory
-        ↓
-Semi-automatic Profile Discovery
-        ↓
-User-Profile Hyperedge Pool
-        ↓
-Profile fast-channel retrieval
-        ↓ insufficient
-Fallback retrieval
-```
-
-用户画像不是纯强化学习直接学出来的，而是：
+核心流程：
 
 ```text
-seed rule typing + unsupervised discovery + reward-guided optimization
-```
-
-也就是先用少量规则种子稳定识别常见画像，再把低置信记忆放入 discovery buffer，通过相似性聚类自动形成新的画像超边，最后用检索命中和回答质量奖励长期更新超边权重。
-
----
-
-## 1. 方法定位
-
-HyperMem 主要解决长期对话记忆的结构组织问题：
-
-```text
-Topic → Episode → Fact
-```
-
-本项目进一步解决：
-
-```text
-如何在长期交互中发现用户画像、使用习惯、长期目标和当前任务状态，
-并把这些高价值记忆组织成可快速检索的 profile hyperedge pool。
-```
-
----
-
-## 2. 三种画像发现模式
-
-### rule
-
-人工预设 seed profile types：
-
-```text
-preference / goal / habit / current_state / domain_knowledge / temporal_evolution
-```
-
-优点是快、稳、可解释；缺点是不能发现新的用户画像维度。
-
-### unsupervised
-
-不预设画像类别。所有 fact 进入 discovery buffer，通过相似性聚类形成：
-
-```text
-auto_discovered profile hyperedges
-```
-
-优点是能发现未知用户习惯；缺点是低数据量时可能有噪声。
-
-### hybrid 默认
-
-高置信规则类别直接归入 seed profile hyperedge；低置信 fact 进入 discovery buffer，再由无监督聚类形成新画像超边。
-
-```text
-New fact
+Memory Facts
   ↓
-Rule seed classifier
-  ├── high confidence → seed profile hyperedge
-  └── low confidence  → discovery buffer → auto_discovered hyperedge
+User Profile Hyperedges
   ↓
-Reward-guided utility update
+Local Embedding Index
+  ↓
+Reward-guided Utility Training
+  ↓
+Profile Hyperedge Ranking
+  ↓
+Fact Evidence Selection
+  ↓
+Accuracy / Recall / Token Evaluation
 ```
 
-这是当前推荐主方法。
-
----
-
-## 3. 新增代码
+也就是把 HyperMem 的 `Topic -> Episode -> Fact` 主检索路径，改成：
 
 ```text
-hypermem/profile_hyperedge_pool.py
-examples/user_profile_hyperedge_demo.py
-examples/profile_hyperedge_pool_eval.py
-scripts/run_profile_hyperedge_pool.sh
+Query -> User Profile Hyperedge -> Fact
 ```
 
-核心模块包含：
+## 方法含义
 
-- `MemoryNode`：Topic / Episode / Fact 的轻量节点视图；
-- `ProfileHyperedge`：用户画像超边；
-- `UserProfileHyperedgePool`：半自动动态超边池；
-- `ProfileTypingMode`：`rule / unsupervised / hybrid`；
-- `discover_profile_hyperedges()`：无监督画像超边发现；
-- `retrieve_fast_channel()`：画像超边池快速检索；
-- `update_rewards()`：根据命中和回答质量更新超边 utility；
-- `save()` / `load()`：保存和加载超边池。
+- `Fact`：底层事实证据。
+- `User Profile Hyperedge`：用户画像超边，连接一组共同描述用户偏好、目标、习惯、当前状态或研究方向的 facts。
+- `Embedding`：当前版本使用本地 hashed embedding 和 cosine similarity，不依赖 GPU/API；正式实验可替换为 Qwen/OpenAI embedding。
+- `Reward Utility`：轻量 bandit-style 更新，不训练大模型；训练 QA 命中、召回高、token 少则升权，否则降权。
+- `Retrieval`：先按 query 和画像超边的 embedding similarity 召回，再结合 utility/freshness/stability 等分数重排，最后从超边成员 facts 中选择证据。
 
----
+## 代码结构
 
-## 4. 安装
+```text
+hypermem/profile_centric_hypergraph.py
+examples/prepare_profile_centric_data.py
+examples/profile_centric_hypergraph_eval.py
+scripts/run_profile_centric_hypergraph.sh
+docs/profile_centric_hypergraph.md
+```
 
-建议使用原环境：
+## 快速运行 demo
 
 ```bash
 conda activate wwt_hyperMem
+
+bash scripts/run_profile_centric_hypergraph.sh \
+  DEMO \
+  outputs/profile_centric_demo \
+  1.0 \
+  0.5
 ```
 
-或新建环境：
+## 使用自己的数据
 
 ```bash
-conda create -n memory_my python=3.12 -y
-conda activate memory_my
-pip install -r requirements.txt
+bash scripts/run_profile_centric_hypergraph.sh \
+  /home/sutongtong/wwt/code \
+  outputs/profile_centric_hg \
+  0.5 \
+  0.5
 ```
 
-当前新增 demo 只依赖 Python 标准库。
-
----
-
-## 5. 运行 demo
-
-```bash
-python examples/user_profile_hyperedge_demo.py
-```
-
-它会依次演示：
+参数含义：
 
 ```text
-rule
-unsupervised
-hybrid
+第 1 个参数：数据来源目录；用 DEMO 表示内置小数据
+第 2 个参数：输出目录
+第 3 个参数：数据使用比例，例如 0.5 表示使用一半数据
+第 4 个参数：QA 训练比例，例如 0.5 表示前 50% QA 用于 reward utility 训练，后 50% 用于测试
 ```
 
-输出文件：
+## 输出文件
 
 ```text
-outputs/profile_hyperedge_demo_pool_rule.json
-outputs/profile_hyperedge_demo_pool_unsupervised.json
-outputs/profile_hyperedge_demo_pool_hybrid.json
+outputs/profile_centric_hg/data_report.json
+outputs/profile_centric_hg/eval/profile_centric_summary.csv
+outputs/profile_centric_hg/eval/profile_centric_summary.json
+outputs/profile_centric_hg/eval/profile_centric_results.csv
+outputs/profile_centric_hg/eval/profile_centric_trace.jsonl
+outputs/profile_centric_hg/eval/profile_centric_trained_memory.json
 ```
 
----
-
-## 6. 运行 retrieval-only 评测
-
-一键运行三种模式：
+重点查看：
 
 ```bash
-bash scripts/run_profile_hyperedge_pool.sh outputs/profile_eval
+cat outputs/profile_centric_hg/eval/profile_centric_summary.csv
 ```
 
-单独运行 hybrid 主方法：
-
-```bash
-python examples/profile_hyperedge_pool_eval.py \
-  --profile-typing-mode hybrid \
-  --output-dir outputs/profile_hybrid
-```
-
-对比三种模式：
-
-```bash
-python examples/profile_hyperedge_pool_eval.py --profile-typing-mode rule --output-dir outputs/profile_rule
-python examples/profile_hyperedge_pool_eval.py --profile-typing-mode unsupervised --output-dir outputs/profile_unsup
-python examples/profile_hyperedge_pool_eval.py --profile-typing-mode hybrid --output-dir outputs/profile_hybrid
-```
-
-关闭 fallback 做消融：
-
-```bash
-python examples/profile_hyperedge_pool_eval.py \
-  --profile-typing-mode hybrid \
-  --no-fallback \
-  --output-dir outputs/profile_hybrid_no_fallback
-```
-
----
-
-## 7. 使用自己的数据
-
-```bash
-python examples/profile_hyperedge_pool_eval.py \
-  --memory-json data/my_memory_facts.jsonl \
-  --questions-json data/my_questions.jsonl \
-  --profile-typing-mode hybrid \
-  --output-dir outputs/profile_eval
-```
-
-Memory fact 示例：
-
-```json
-{"content": "用户喜欢先分析论文原理，再判断创新性，最后生成 Codex prompt。"}
-```
-
-推荐格式：
-
-```json
-{
-  "fact_id": "fact_001",
-  "content": "用户当前研究主线是用户画像引导的动态超边池快速通道。",
-  "keywords": ["用户画像", "动态超边池", "快速通道"],
-  "timestamp": 12,
-  "topic_id": "memory_research",
-  "episode_ids": ["episode_003"]
-}
-```
-
-Question 示例：
-
-```json
-{
-  "qid": "q_001",
-  "question": "我现在这个 memory 方案的核心是什么？",
-  "gold": ["用户画像", "动态超边池"],
-  "category": "current_state"
-}
-```
-
----
-
-## 8. 输出文件
-
-每个输出目录包含：
+主要方法行：
 
 ```text
-profile_hyperedge_pool_results.csv
-profile_hyperedge_pool_by_category.csv
-profile_hyperedge_pool_summary.json
-profile_hyperedge_pool_trace.jsonl
-profile_hyperedge_pool.json
+embedding_only_profile_hg
+reward_utility_train
+reward_utility_frozen_test
+online_predict_then_update_test
 ```
 
-summary 中包含：
+其中：
 
-```text
-hit
-recall
-tokens
-reward
-fallback_rate
-edge_type_counts
-num_edges
-active_edges
-discovery_buffer_size
-```
-
----
-
-## 9. 支持的画像超边类型
-
-| 类型 | 含义 |
-|---|---|
-| `preference` | 用户偏好，例如回答风格、分析方式 |
-| `goal` | 用户长期目标，例如投稿、研究目标 |
-| `habit` | 用户使用习惯和工作流 |
-| `domain_knowledge` | 用户当前研究领域常用知识 |
-| `current_state` | 用户当前任务状态和最新方案 |
-| `temporal_evolution` | 用户想法或目标的时间演化 |
-| `evidence_group` | 支撑某类问题的一组证据 |
-| `supersede` | 新画像覆盖旧画像 |
-| `auto_discovered` | 无监督发现的新画像维度 |
-| `other` | 其他 profile 相关记忆 |
-
----
-
-## 10. 当前定位
-
-本项目当前主线可以概括为：
-
-> 在 HyperMem 的 Topic-Episode-Fact 长期记忆底座之上，构建一个半自动、奖励优化的用户画像超边池，使高价值、常用、符合用户习惯和当前任务状态的记忆形成快速检索通道；当快速通道证据不足时，再回退到备用检索路径。
+- `embedding_only_profile_hg`：只用 embedding 相似度，不使用训练后的 utility。
+- `reward_utility_train`：训练阶段，使用 QA feedback 更新画像超边 utility。
+- `reward_utility_frozen_test`：测试阶段冻结 utility，评估最终 accuracy / recall / token。
+- `online_predict_then_update_test`：在线评估，每个测试问题先计分，再用反馈更新。
