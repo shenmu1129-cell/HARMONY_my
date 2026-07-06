@@ -1,1 +1,1 @@
-from hypermem.hypermem_style_hierarchy_builder import *
+from hypermem.imported_stage1_hierarchy_builder import *
