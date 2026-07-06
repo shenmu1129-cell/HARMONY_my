@@ -238,6 +238,11 @@ def summarize(rows):
     return out
 
 
+def row_for_fields(method: str, summary: Dict[str, Any], fields: Sequence[str]) -> Dict[str, Any]:
+    row = {"method": method, **summary}
+    return {field: row.get(field, "") for field in fields}
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--memory-graph", required=True)
@@ -282,14 +287,18 @@ def main() -> None:
     by: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         by.setdefault(row["method"], []).append(row)
-    fields = ["method", "n", "accuracy", "recall", "tokens", "retrieval_ms", "num_facts", "selected_edges", "selected_dialogues", "dialogue_rows", "condition_tokens", "fact_tokens", "dialogue_tokens"]
+    fields = [
+        "method", "n", "accuracy", "hit", "recall", "tokens", "reward", "fallback_rate",
+        "retrieval_ms", "num_facts", "selected_edges", "selected_dialogues", "dialogue_rows",
+        "condition_tokens", "fact_tokens", "dialogue_tokens",
+    ]
+    summaries = {m: summarize(r) for m, r in by.items()}
     with (outdir / "conditioned_dialogue_summary.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        for method, method_rows in by.items():
-            s = summarize(method_rows)
-            writer.writerow({"method": method, **s})
-    (outdir / "conditioned_dialogue_summary.json").write_text(json.dumps({m: summarize(r) for m, r in by.items()}, ensure_ascii=False, indent=2), encoding="utf-8")
+        for method, summary in summaries.items():
+            writer.writerow(row_for_fields(method, summary, fields))
+    (outdir / "conditioned_dialogue_summary.json").write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
     print((outdir / "conditioned_dialogue_summary.csv").read_text(encoding="utf-8"))
 
 
