@@ -1,16 +1,15 @@
 """Build the full hybrid memory pipeline.
 
-Required stage order implemented here:
+Pipeline:
 
-1. LLM extracts Topic -> Episode -> Fact hierarchy.
-2. Behavioral profile hyperedges are induced from the extracted facts and
-   episode/topic metadata.
-3. A lightweight RL/bandit-style utility prior is initialized from hyperedge
-   features; later QA feedback can update it through eval_behavioral_profile_graph.py.
-4. Facts and behavioral hyperedges are embedded/indexed inside
-   ProfileCentricHypergraphMemory.
-5. Retrieval is performed by first selecting behavioral hyperedges and then
-   selecting member facts.
+1. Build a Topic -> Episode -> Fact hierarchy.
+2. Induce behavioral/profile hyperedges from the extracted facts and metadata.
+3. Initialize lightweight utility priors.
+4. Materialize embeddings/indexes in ProfileCentricHypergraphMemory.
+5. Export graph and reports.
+
+For quick dataset smoke tests, both hierarchy construction and behavioral
+hyperedge induction can run in local non-LLM mode.
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hypermem.batch_profile_builder import build_profile_hypergraph_from_rows  # noqa: E402
 from hypermem.behavioral_profile import (  # noqa: E402
     behavioral_profile_summary,
     initialize_behavioral_priors,
@@ -112,6 +112,7 @@ def main() -> None:
     parser.add_argument("--utility-prior-strength", type=float, default=0.08)
     parser.add_argument("--pool-top-k", type=int, default=50)
     parser.add_argument("--no-llm-hierarchy", action="store_true", help="Use fallback hierarchy wrapper if input is already fact-like or for debugging.")
+    parser.add_argument("--no-llm-behavior", action="store_true", help="Use local deterministic feature induction instead of LLM behavioral hyperedge induction.")
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
 
@@ -122,7 +123,7 @@ def main() -> None:
     if args.max_memory:
         raw_rows = raw_rows[: args.max_memory]
 
-    print("[pipeline] stage=1 llm_topic_episode_fact_extraction", flush=True)
+    print("[pipeline] stage=1 topic_episode_fact_extraction", flush=True)
     hierarchy = extract_topic_episode_fact_hierarchy(
         raw_rows,
         batch_size=args.hierarchy_batch_size,
@@ -130,26 +131,38 @@ def main() -> None:
         show_progress=not args.no_progress,
     )
     hierarchy_facts = save_hierarchy_outputs(hierarchy, out_dir)
-    # Use a flattened copy with topic/episode context appended to metadata. The
-    # text itself stays atomic so fact-level retrieval remains clean.
     behavior_rows = flatten_hierarchy_facts(hierarchy)
 
     print("[pipeline] stage=2 behavioral_hyperedge_induction_from_extracted_facts", flush=True)
     memory = ProfileCentricHypergraphMemory(user_id="behavioral_hybrid_memory")
-    build_english_llm_profile_hypergraph_from_rows(
-        memory,
-        behavior_rows,
-        batch_size=args.behavior_batch_size,
-        canonical_threshold=args.canonical_threshold,
-        consolidate_every=args.consolidate_every,
-        llm_consolidation_rounds=args.llm_consolidation_rounds,
-        max_edge_facts=args.max_edge_facts,
-        max_features_per_batch=args.max_features_per_batch,
-        max_features_per_fact=args.max_features_per_fact,
-        show_progress=not args.no_progress,
-    )
+    if args.no_llm_behavior:
+        print("[pipeline] stage=2 mode=local_batch_feature_induction_no_api", flush=True)
+        build_profile_hypergraph_from_rows(
+            memory,
+            behavior_rows,
+            batch_size=args.behavior_batch_size,
+            canonical_threshold=args.canonical_threshold,
+            min_feature_support=1,
+            consolidate_every=args.consolidate_every,
+            max_edge_facts=args.max_edge_facts,
+            show_progress=not args.no_progress,
+        )
+    else:
+        print("[pipeline] stage=2 mode=llm_behavioral_hyperedge_induction", flush=True)
+        build_english_llm_profile_hypergraph_from_rows(
+            memory,
+            behavior_rows,
+            batch_size=args.behavior_batch_size,
+            canonical_threshold=args.canonical_threshold,
+            consolidate_every=args.consolidate_every,
+            llm_consolidation_rounds=args.llm_consolidation_rounds,
+            max_edge_facts=args.max_edge_facts,
+            max_features_per_batch=args.max_features_per_batch,
+            max_features_per_fact=args.max_features_per_fact,
+            show_progress=not args.no_progress,
+        )
 
-    print("[pipeline] stage=3 reward_guided_utility_prior_from_hyperedge_features", flush=True)
+    print("[pipeline] stage=3 utility_prior_from_hyperedge_features", flush=True)
     initialize_behavioral_priors(memory, prior_strength=args.utility_prior_strength)
 
     print("[pipeline] stage=4 embedding_and_index_materialization", flush=True)
@@ -170,11 +183,11 @@ def main() -> None:
 
     report = {
         "pipeline_order": [
-            "llm_extract_topic_episode_fact",
+            "extract_or_wrap_topic_episode_fact_hierarchy",
             "induce_behavioral_profile_hyperedges_using_hierarchy_facts",
-            "initialize_reward_guided_utility_prior_from_hyperedge_features",
+            "initialize_utility_prior_from_hyperedge_features",
             "embed_and_index_facts_and_behavioral_hyperedges",
-            "retrieve_by_behavioral_hyperedge_then_member_facts",
+            "export_cost_aware_retrieval_graph",
         ],
         "num_raw_rows": len(raw_rows),
         "num_hierarchy_facts": len(hierarchy_facts),
