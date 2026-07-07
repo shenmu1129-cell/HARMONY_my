@@ -190,6 +190,8 @@ def safe_json(text: str) -> Dict[str, Any]:
 
 def load_examples(path: Path, max_examples: int = 0, start_index: int = 0, skip_abs: bool = False) -> List[LongMemExample]:
     raw = json.loads(path.read_text(encoding="utf-8"))
+    if raw and isinstance(raw[0], dict) and "qa" in raw[0] and "conversation" in raw[0]:
+        return load_locomo_examples(raw, max_examples=max_examples, start_index=start_index)
     examples: List[LongMemExample] = []
     for item in raw[start_index:]:
         qid = str(item["question_id"])
@@ -205,6 +207,130 @@ def load_examples(path: Path, max_examples: int = 0, start_index: int = 0, skip_
                 question_date=str(item.get("question_date") or ""),
                 rows=rows,
                 answer_session_ids=[str(x) for x in item.get("answer_session_ids", [])],
+            )
+        )
+        if max_examples and len(examples) >= max_examples:
+            break
+    return examples
+
+
+def _locomo_session_date(conversation: Dict[str, Any], session_idx: int) -> str:
+    return str(conversation.get(f"session_{session_idx}_date_time") or conversation.get(f"session_{session_idx}_date") or "")
+
+
+def _stringify_summary(value: Any) -> str:
+    parts: List[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "date":
+                continue
+            child_text = _stringify_summary(child)
+            if child_text:
+                parts.append(f"{key}: {child_text}")
+    elif isinstance(value, list):
+        for child in value:
+            if isinstance(child, list) and child:
+                parts.append(str(child[0]))
+            elif isinstance(child, (dict, list)):
+                child_text = _stringify_summary(child)
+                if child_text:
+                    parts.append(child_text)
+            elif child:
+                parts.append(str(child))
+    elif value:
+        parts.append(str(value))
+    return " ".join(parts)
+
+
+def _locomo_summary_for_session(item: Dict[str, Any], session_idx: int) -> str:
+    chunks: List[str] = []
+    for root_key, prefix in (("observation", "Observation"), ("session_summary", "Session summary"), ("event_summary", "Event summary")):
+        root = item.get(root_key) or {}
+        if not isinstance(root, dict):
+            continue
+        for key in (
+            f"session_{session_idx}_observation",
+            f"session_{session_idx}",
+            f"events_session_{session_idx}",
+        ):
+            text = _stringify_summary(root.get(key))
+            if text:
+                chunks.append(f"{prefix}: {text}")
+    return "\n".join(dict.fromkeys(chunks))
+
+
+def flatten_locomo_rows(item: Dict[str, Any], evidence_ids: Sequence[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    evidence_set = {str(x) for x in evidence_ids}
+    conversation = item.get("conversation") or {}
+    sample_id = str(item.get("sample_id") or "locomo")
+    session_nums = sorted(
+        int(match.group(1))
+        for key in conversation
+        for match in [re.fullmatch(r"session_(\d+)", str(key))]
+        if match
+    )
+    for si in session_nums:
+        date = _locomo_session_date(conversation, si)
+        session_summary = _locomo_summary_for_session(item, si)
+        for ti, turn in enumerate(conversation.get(f"session_{si}") or []):
+            speaker = str(turn.get("speaker") or "unknown")
+            dia_id = str(turn.get("dia_id") or f"D{si}:{ti + 1}")
+            text = str(turn.get("text") or "")
+            caption = str(turn.get("blip_caption") or "")
+            query = str(turn.get("query") or "")
+            if caption:
+                text = f"{text} Image caption: {caption}"
+            if query:
+                text = f"{text} Image query: {query}"
+            if not text.strip():
+                continue
+            rows.append(
+                {
+                    "row_id": f"{sample_id}::{dia_id}",
+                    "session_id": f"session_{si}",
+                    "session_index": si - 1,
+                    "turn_index": ti,
+                    "date": date,
+                    "role": speaker,
+                    "dia_id": dia_id,
+                    "has_answer": dia_id in evidence_set,
+                    "content": f"[{date}] {speaker}: {text}",
+                    "raw_content": text,
+                    "session_summary": session_summary,
+                }
+            )
+    return rows
+
+
+def load_locomo_examples(raw: Sequence[Dict[str, Any]], max_examples: int = 0, start_index: int = 0) -> List[LongMemExample]:
+    examples: List[LongMemExample] = []
+    flat_qas: List[Tuple[Dict[str, Any], int, Dict[str, Any]]] = []
+    for item in raw:
+        for qi, qa in enumerate(item.get("qa") or []):
+            flat_qas.append((item, qi, qa))
+    for item, qi, qa in flat_qas[start_index:]:
+        evidence = [str(x) for x in qa.get("evidence") or []]
+        rows = flatten_locomo_rows(item, evidence)
+        evidence_sessions = {
+            str(row["session_id"])
+            for row in rows
+            if str(row.get("dia_id") or "") in set(evidence)
+        }
+        question_date = ""
+        if rows:
+            max_session = max(int(row.get("session_index") or 0) for row in rows)
+            dates = [str(row.get("date") or "") for row in rows if int(row.get("session_index") or 0) == max_session]
+            question_date = dates[0] if dates else ""
+        examples.append(
+            LongMemExample(
+                qid=f"{item.get('sample_id', 'locomo')}::qa_{qi:03d}",
+                qtype=f"locomo_category_{qa.get('category', 'unknown')}",
+                question=str(qa.get("question") or ""),
+                answer=str(qa.get("answer") or ""),
+                question_date=question_date,
+                rows=rows,
+                answer_session_ids=sorted(evidence_sessions),
             )
         )
         if max_examples and len(examples) >= max_examples:
@@ -261,11 +387,13 @@ def build_memory(rows: Sequence[Dict[str, Any]]) -> ProfileCentricHypergraphMemo
     for sid, fids in session_fact_ids.items():
         facts = [memory.facts[fid] for fid in fids]
         date = str(facts[0].metadata.get("date") or "") if facts else ""
+        summary_hint = str(facts[0].metadata.get("session_summary") or "") if facts else ""
         sample = " ".join(f.content for f in facts[:3])
+        edge_summary = summary_hint[:900] if summary_hint else f"LongMemEval session {sid} at {date}: {sample[:360]}"
         memory.create_edge(
             ProfileEdgeType.AUTO_DISCOVERED,
             fids,
-            summary=f"LongMemEval session {sid} at {date}: {sample[:360]}",
+            summary=edge_summary,
             confidence=0.62,
             metadata={"edge_kind": "session", "session_id": sid, "date": date},
         )
@@ -324,9 +452,13 @@ def build_episode_topic_docs(facts: Sequence[ProfileFact]) -> Tuple[Dict[str, Di
     for sid, sfacts in sessions.items():
         sfacts = sorted(sfacts, key=lambda f: int(f.metadata.get("turn_index") or 0))
         date = str(sfacts[0].metadata.get("date") or "") if sfacts else ""
+        summary_hint = str(sfacts[0].metadata.get("session_summary") or "") if sfacts else ""
         user_lines = [str(f.metadata.get("raw_content") or f.content) for f in sfacts if str(f.metadata.get("role") or "") == "user"]
         all_lines = [f"{f.metadata.get('role')}: {f.metadata.get('raw_content') or f.content}" for f in sfacts]
-        text = f"Episode date: {date}\n" + "\n".join(user_lines[:10] or all_lines[:10])
+        text = f"Episode date: {date}\n"
+        if summary_hint:
+            text += f"Gate summary: {summary_hint[:1200]}\n"
+        text += "\n".join(user_lines[:10] or all_lines[:10])
         episodes[sid] = {"id": sid, "date": date, "facts": sfacts, "text": text}
 
     # Lightweight topic aggregation: group episodes by their strongest content words.
@@ -712,11 +844,29 @@ MONTHS = {
 
 def parse_session_date(text: str) -> dt.datetime | None:
     match = re.search(r"(\d{4})/(\d{2})/(\d{2})(?:\s+\([^)]*\)\s+(\d{2}):(\d{2}))?", text or "")
+    if match:
+        year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        hour = int(match.group(4) or 0)
+        minute = int(match.group(5) or 0)
+        return dt.datetime(year, month, day, hour, minute)
+    match = re.search(
+        r"(?:(\d{1,2}):(\d{2})\s*(am|pm)\s+on\s+)?(\d{1,2})\s+"
+        r"(January|February|March|April|May|June|July|August|September|October|November|December),?\s+(\d{4})",
+        text or "",
+        flags=re.I,
+    )
     if not match:
         return None
-    year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
-    hour = int(match.group(4) or 0)
-    minute = int(match.group(5) or 0)
+    hour = int(match.group(1) or 0)
+    minute = int(match.group(2) or 0)
+    ampm = (match.group(3) or "").lower()
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    day = int(match.group(4))
+    month = MONTHS[match.group(5).lower()]
+    year = int(match.group(6))
     return dt.datetime(year, month, day, hour, minute)
 
 
@@ -828,7 +978,11 @@ def generate_and_judge(
     instruction = (
         "Answer the LongMemEval question using only the retrieved conversation evidence. "
         "Use the temporal calculation notes to compare dates, relative times, durations, and clock times. "
-        "You must output a non-empty short phrase. If the evidence is insufficient, output \"I don't know\"."
+        "If a turn says a relative time such as last week, yesterday, or years ago, anchor it to that turn's session date. "
+        "It is acceptable to answer with a relative phrase such as \"the week before 9 June 2023\" when that is the most faithful answer. "
+        "When the evidence contains a direct clue, do not answer \"I don't know\" just because the exact calendar date is implicit. "
+        "You must output one non-empty short phrase, preserving important qualifiers such as who the career or event is for. "
+        "If the evidence is genuinely insufficient, output \"I don't know\"."
         if reader_mode in {"temporal", "temporal_strict"}
         else
         "Answer the LongMemEval question using only the retrieved conversation evidence. "
@@ -966,9 +1120,9 @@ def main() -> None:
     ]
     router = ThompsonRouter(rl_arms)
     full_rl_arms = [
-        MethodConfig("arm_full_compact", graph_gate="hypermem_full", top_k_facts=16, max_tokens=1000, initial_candidates=120, topic_top_k=6, episode_top_k=12, lambda_prop=0.5),
-        MethodConfig("arm_full_default", graph_gate="hypermem_full", top_k_facts=30, max_tokens=1800, initial_candidates=200, topic_top_k=10, episode_top_k=20, lambda_prop=0.5),
-        MethodConfig("arm_full_broad", graph_gate="hypermem_full", top_k_facts=40, max_tokens=2400, initial_candidates=240, topic_top_k=12, episode_top_k=25, lambda_prop=0.5),
+        MethodConfig("arm_full_compact", graph_gate="hypermem_full", top_k_facts=20, max_tokens=1250, initial_candidates=70, topic_top_k=6, episode_top_k=12, lambda_prop=0.5),
+        MethodConfig("arm_full_default", graph_gate="hypermem_full", top_k_facts=24, max_tokens=1500, initial_candidates=85, topic_top_k=8, episode_top_k=16, lambda_prop=0.5),
+        MethodConfig("arm_full_broad", graph_gate="hypermem_full", top_k_facts=28, max_tokens=1700, initial_candidates=100, topic_top_k=10, episode_top_k=18, lambda_prop=0.5),
     ]
     full_router = ThompsonRouter(full_rl_arms, seed=23)
 
@@ -984,8 +1138,10 @@ def main() -> None:
             full_arm_idx = full_router.select(ex, train=True)
             full_ret = retrieve_method(ex, memory, full_rl_arms[full_arm_idx], qwen_embed=qwen_embed, qwen_reranker=qwen_reranker)
             fm = retrieval_metrics(ex, full_ret)
-            full_reward = 0.45 * fm["fact_hit"] + 0.35 * fm["answer_turn_recall"] + 0.20 * fm["all_answer_turns_hit"]
-            full_reward -= min(0.15, full_ret.tokens / 6000.0)
+            full_latency = float(full_ret.debug_scores[0].get("latency_ms", 0.0)) if full_ret.debug_scores else 0.0
+            full_reward = 0.55 * fm["fact_hit"] + 0.30 * fm["answer_turn_recall"] + 0.15 * fm["all_answer_turns_hit"]
+            full_reward -= min(0.16, full_ret.tokens / 9000.0)
+            full_reward -= min(0.06, full_latency / 14000.0)
             full_router.update(ex, full_arm_idx, full_reward)
 
     cache_path = out_dir / "llm_cache.json"
