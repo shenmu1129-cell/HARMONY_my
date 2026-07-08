@@ -1,109 +1,400 @@
-# Profile-Centric Hypergraph Memory
+# HARMONY-Mem
 
-本仓库当前只保留一个主线：**基于用户画像超边的长期记忆检索**。
+**HARMONY-Mem** is a hypergraph-based long-term memory retrieval framework for LLM agents.
+It formulates different retrieval paths over structured memory as an **action space**, and uses a lightweight **Bandit / RL policy** to select the most suitable retrieval action for each query.
 
-核心流程：
+The core idea is simple:
 
-```text
-Memory Facts
-  ↓
-User Profile Hyperedges
-  ↓
-Local Embedding Index
-  ↓
-Reward-guided Utility Training
-  ↓
-Profile Hyperedge Ranking
-  ↓
-Fact Evidence Selection
-  ↓
-Accuracy / Recall / Token Evaluation
-```
+> Different queries need different memory retrieval paths. HARMONY-Mem learns which hypergraph path to use while preserving the original evidence.
 
-也就是把 HyperMem 的 `Topic -> Episode -> Fact` 主检索路径，改成：
+---
+
+## 1. Overview
+
+HARMONY-Mem follows a query-conditioned retrieval pipeline:
 
 ```text
-Query -> User Profile Hyperedge -> Fact
+Memory Leaves
+  ↓
+Structured Hypergraph Construction
+  - Topic
+  - Episode
+  - Fact
+  - Behavioral Hyperedges
+  ↓
+Hypergraph Retrieval Action Space
+  - Hybrid Traversal
+  - Edge-Source Retrieval
+  - Global Leaf Retrieval
+  - Adaptive Fallback
+  ↓
+Bandit / RL Policy
+  - Thompson Sampling
+  - UCB
+  - LinUCB
+  ↓
+Retrieval Execution
+  ↓
+Source-Preserving Leaf Backtracking
+  ↓
+Evidence / Retrieval Result
+  ↓
+Reward-based Policy Update
 ```
 
-## 方法含义
+Compared with fixed RAG or fixed hypergraph traversal, HARMONY-Mem does not use the same retrieval rule for every query. Instead, it treats different hypergraph retrieval paths as actions and learns a policy to select among them.
 
-- `Fact`：底层事实证据。
-- `User Profile Hyperedge`：用户画像超边，连接一组共同描述用户偏好、目标、习惯、当前状态或研究方向的 facts。
-- `Embedding`：当前版本使用本地 hashed embedding 和 cosine similarity，不依赖 GPU/API；正式实验可替换为 Qwen/OpenAI embedding。
-- `Reward Utility`：轻量 bandit-style 更新，不训练大模型；训练 QA 命中、召回高、token 少则升权，否则降权。
-- `Retrieval`：先按 query 和画像超边的 embedding similarity 召回，再结合 utility/freshness/stability 等分数重排，最后从超边成员 facts 中选择证据。
+---
 
-## 代码结构
+## 2. Key Ideas
+
+### 2.1 Structured Hypergraph Memory
+
+HARMONY-Mem starts from original memory leaves, such as PersonaChat-style user memories. These memories are organized into a structured hypergraph with multiple semantic levels:
+
+| Component | Meaning |
+|---|---|
+| `Fact` | Atomic memory evidence, usually corresponding to the original memory leaf. |
+| `Episode` | Event-level grouping of related facts. |
+| `Topic` | High-level semantic organization. |
+| `Behavioral Hyperedge` | A hyperedge that connects multiple related memory units describing user preferences, habits, goals, or behavioral patterns. |
+
+In the current implementation, **facts / memory leaves remain the final evidence source**. Topic, episode, and behavioral hyperedges are used to guide retrieval, but the final evidence is traced back to the original memory leaves.
+
+---
+
+### 2.2 Hypergraph Retrieval Action Space
+
+The retrieval action space contains several representative retrieval paths over the memory hypergraph:
+
+| Action | Description |
+|---|---|
+| `hybrid traversal` | Traverses Topic / Episode / Fact / Hyperedge structures jointly. |
+| `edge-source retrieval` | Retrieves relevant hyperedges and then returns their original source memory leaves. |
+| `global leaf retrieval` | Directly retrieves top-k memory leaves from the global memory bank. |
+| `adaptive fallback` | Uses a lightweight fallback path when the query is ambiguous or the main retrieval path is uncertain. |
+
+The current experimental code defines several action-space settings:
 
 ```text
-hypermem/profile_centric_hypergraph.py
-examples/prepare_profile_centric_data.py
-examples/profile_centric_hypergraph_eval.py
-scripts/run_profile_centric_hypergraph.sh
-docs/profile_centric_hypergraph.md
+core
+llm_pruned
+fast_pruned
+dynamic_k
 ```
 
-## 快速运行 demo
+For the main lightweight setting, `fast_pruned` uses a compact set of actions:
+
+```text
+hybrid_roi_light_k3
+edge_source_response
+global_response_k2
+adaptive_tiny_ref
+```
+
+---
+
+### 2.3 Bandit / RL-based Query Routing
+
+HARMONY-Mem formulates memory retrieval as a **query routing bandit problem**.
+
+For each query, the system extracts a query state, including:
+
+```text
+query type
+keywords
+semantic cues
+route confidence
+historical feedback
+```
+
+Then a Bandit / RL policy selects one retrieval action from the action space.
+
+Supported policies include:
+
+```text
+epsilon_greedy
+ucb1
+thompson
+exp3
+softmax_pg
+linucb
+dynamic_k_ucb
+```
+
+The policy is updated using retrieval feedback. A typical reward is:
+
+```text
+Reward = Hit / Recall - Token Cost - Latency Cost
+```
+
+Thus, the policy learns not only which action is accurate, but also which action is more token-efficient and latency-efficient.
+
+---
+
+### 2.4 Source-Preserving Leaf Backtracking
+
+Intermediate topic, episode, or hyperedge nodes are useful for retrieval, but they may be summaries or high-level abstractions. To reduce evidence drift, HARMONY-Mem always traces the final evidence back to the original memory leaves.
+
+```text
+Query
+  → Selected Hypergraph Action
+  → Topic / Episode / Fact / Hyperedge Traversal
+  → Source-Preserving Leaf Backtracking
+  → Original Memory Evidence
+```
+
+This design makes the retrieved evidence more faithful and easier to evaluate.
+
+---
+
+## 3. Repository Structure
+
+```text
+HARMONY/
+├── data/                         # Data files or prepared examples
+├── docs/                         # Notes and method documentation
+├── examples/                     # Data preparation, graph construction, and retrieval evaluation
+│   ├── prepare_parlai_memory_data.py
+│   ├── build_behavioral_hybrid_memory.py
+│   ├── eval_behavioral_profile_graph.py
+│   ├── eval_cost_aware_retrieval.py
+│   ├── policy_routing_eval.py
+│   └── profile_centric_hypergraph_eval.py
+├── experiments/                  # Main experimental scripts
+│   ├── eval_persona_advanced_retrieval.py
+│   ├── eval_persona_report_compare.py
+│   ├── eval_persona_rl_retrieval.py
+│   ├── eval_persona_llm_judge_rag.py
+│   ├── eval_memory_module_ablation.py
+│   └── eval_longmemeval_mini.py
+├── hypermem/                     # Core memory and retrieval modules
+│   ├── profile_centric_hypergraph.py
+│   ├── behavioral_profile.py
+│   ├── cost_aware_retrieval.py
+│   ├── dual_path_retrieval.py
+│   ├── hypermem_style_hierarchy_builder.py
+│   ├── llm_hierarchy_builder.py
+│   ├── llm_profile_builder.py
+│   └── query_router.py
+├── scripts/                      # Running scripts
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## 4. Installation
 
 ```bash
-conda activate wwt_hyperMem
+git clone https://github.com/shenmu1129-cell/HARMONY.git
+cd HARMONY
 
-bash scripts/run_profile_centric_hypergraph.sh \
-  DEMO \
-  outputs/profile_centric_demo \
-  1.0 \
-  0.5
+conda create -n harmony python=3.10 -y
+conda activate harmony
+
+pip install -r requirements.txt
 ```
 
-## 使用自己的数据
+If you already have a working environment, you can directly install the required packages:
 
 ```bash
-bash scripts/run_profile_centric_hypergraph.sh \
-  /home/sutongtong/wwt/code \
-  outputs/profile_centric_hg \
-  0.5 \
-  0.5
+pip install -r requirements.txt
 ```
 
-参数含义：
+---
 
-```text
-第 1 个参数：数据来源目录；用 DEMO 表示内置小数据
-第 2 个参数：输出目录
-第 3 个参数：数据使用比例，例如 0.5 表示使用一半数据
-第 4 个参数：QA 训练比例，例如 0.5 表示前 50% QA 用于 reward utility 训练，后 50% 用于测试
-```
+## 5. Quick Start
 
-## 输出文件
-
-```text
-outputs/profile_centric_hg/data_report.json
-outputs/profile_centric_hg/eval/profile_centric_summary.csv
-outputs/profile_centric_hg/eval/profile_centric_summary.json
-outputs/profile_centric_hg/eval/profile_centric_results.csv
-outputs/profile_centric_hg/eval/profile_centric_trace.jsonl
-outputs/profile_centric_hg/eval/profile_centric_trained_memory.json
-```
-
-重点查看：
+### Step 1: Prepare PersonaChat / ConvAI2 / MSC-style memory data
 
 ```bash
-cat outputs/profile_centric_hg/eval/profile_centric_summary.csv
+python examples/prepare_parlai_memory_data.py \
+  --dataset-root /path/to/Persona-Chat \
+  --out-dir outputs/persona_chat/data \
+  --max-memory 50 \
+  --max-questions 1000 \
+  --show-progress
 ```
 
-主要方法行：
+This script writes:
 
 ```text
-embedding_only_profile_hg
-reward_utility_train
-reward_utility_frozen_test
-online_predict_then_update_test
+outputs/persona_chat/data/memory_facts.jsonl
+outputs/persona_chat/data/questions.jsonl
+outputs/persona_chat/data/data_report.json
 ```
 
-其中：
+`memory_facts.jsonl` contains the original memory leaves, while `questions.jsonl` contains QA queries and gold answers.
 
-- `embedding_only_profile_hg`：只用 embedding 相似度，不使用训练后的 utility。
-- `reward_utility_train`：训练阶段，使用 QA feedback 更新画像超边 utility。
-- `reward_utility_frozen_test`：测试阶段冻结 utility，评估最终 accuracy / recall / token。
-- `online_predict_then_update_test`：在线评估，每个测试问题先计分，再用反馈更新。
+---
+
+### Step 2: Build the behavioral hybrid memory graph
+
+```bash
+python examples/build_behavioral_hybrid_memory.py \
+  --memory-json outputs/persona_chat/data/memory_facts.jsonl \
+  --output-dir outputs/persona_chat/graph \
+  --max-memory 50
+```
+
+The constructed graph is usually saved as:
+
+```text
+outputs/persona_chat/graph/behavioral_hybrid_graph.json
+```
+
+---
+
+### Step 3: Run HARMONY-Mem policy retrieval
+
+```bash
+python experiments/eval_persona_rl_retrieval.py \
+  --memory-graph outputs/persona_chat/graph/behavioral_hybrid_graph.json \
+  --memory-json outputs/persona_chat/data/memory_facts.jsonl \
+  --questions-json outputs/persona_chat/data/questions.jsonl \
+  --output-dir outputs/persona_chat/harmony_rl \
+  --max-questions 1000 \
+  --split-train 500 \
+  --policies linucb \
+  --arm-set fast_pruned \
+  --oracle
+```
+
+Important arguments:
+
+| Argument | Meaning |
+|---|---|
+| `--memory-graph` | Path to the constructed memory hypergraph. |
+| `--memory-json` | Path to the original memory leaf file. |
+| `--questions-json` | Path to the QA query file. |
+| `--output-dir` | Directory for experimental results. |
+| `--max-questions` | Number of queries to evaluate. |
+| `--split-train` | Number of queries used for policy learning. |
+| `--policies` | Bandit / RL policies to run. |
+| `--arm-set` | Retrieval action-space setting. |
+| `--oracle` | Evaluate oracle arm upper bound. |
+
+---
+
+## 6. Outputs
+
+The main output files include:
+
+```text
+rl_results.csv
+rl_summary.csv
+rl_trace.jsonl
+rl_policy_states.json
+```
+
+Typical fields include:
+
+| Field | Description |
+|---|---|
+| `method` | Policy and arm-set name. |
+| `phase` | `train`, `test`, `online`, or `oracle`. |
+| `chosen_arm` | Retrieval action selected by the policy. |
+| `accuracy` / `hit` | Whether the retrieved evidence supports the gold answer. |
+| `recall` | Evidence recall against the gold answer. |
+| `tokens` | Evidence token cost. |
+| `retrieval_ms` | Retrieval latency. |
+| `reward` | Combined retrieval reward. |
+
+---
+
+## 7. Example Experimental Setting
+
+The current main experiment uses a PersonaChat partial-memory retrieval setting:
+
+```text
+Memory bank: 50 original memory leaves
+Queries: 1,000 QA queries
+Policy learning: 500 queries
+Testing: 500 queries
+```
+
+This setting evaluates whether a retrieval method can select the correct evidence under limited-memory and low-token constraints. It is different from full-context question answering, where the entire conversation or complete persona profile may be available.
+
+Representative results from the current setting:
+
+| Method | Accuracy ↑ | Tokens ↓ |
+|---|---:|---:|
+| BM25 Retrieval | 0.152 | 45.86 |
+| Response-prior Retrieval | 0.220 | 38.55 |
+| Local Best Static HG | 0.410 | 30.82 |
+| Local Adaptive Tiny | 0.440 | 28.59 |
+| **HARMONY-Mem** | **0.514** | **26.79** |
+| Oracle Upper Bound | 0.663 | - |
+
+The oracle upper bound selects the best retrieval action for each query after observing all candidate actions. It is not a deployable method, but estimates the performance ceiling under the current memory coverage and action space.
+
+---
+
+## 8. Difference from Standard RAG
+
+Standard RAG usually follows a fixed retrieval pipeline:
+
+```text
+Query → Retriever → Top-k Documents → LLM
+```
+
+HARMONY-Mem performs query-conditioned action routing:
+
+```text
+Query
+  → Query State Extraction
+  → Bandit / RL Action Selection
+  → Hypergraph Retrieval
+  → Source-Preserving Leaf Backtracking
+  → Evidence / Retrieval Result
+  → Reward Update
+```
+
+The main difference is that HARMONY-Mem learns which retrieval path should be used for each query.
+
+---
+
+## 9. Difference from HyperMem-style Fixed Retrieval
+
+HyperMem-style memory organizes long-term memory using structured topic, episode, fact, and hyperedge relations. HARMONY-Mem follows this structured-memory motivation, but focuses on adaptive retrieval policy learning.
+
+```text
+HyperMem-style fixed retrieval:
+Query → Fixed Hypergraph Traversal → Evidence
+
+HARMONY-Mem:
+Query → Query State → Bandit / RL Policy → Selected Hypergraph Action → Source-Preserved Evidence
+```
+
+Thus, the main contribution of HARMONY-Mem is not simply building a hypergraph, but learning a query-conditioned policy over hypergraph retrieval actions.
+
+---
+
+## 10. Notes
+
+- The current implementation is a research prototype.
+- The default lightweight experiments can run without training a large language model.
+- Some scripts support LLM-assisted hierarchy or profile construction, but the main reported retrieval experiments focus on policy-based action selection over structured memory.
+- For stronger experiments, future work should evaluate full PersonaChat / ConvAI2 / MSC / LoCoMo settings, stronger dense retrievers, rerankers, and complete HyperMem-style baselines.
+
+---
+
+## Citation
+
+If you use this repository, please cite:
+
+```bibtex
+@misc{harmony_mem,
+  title  = {HARMONY-Mem: Hypergraph Action Reinforced Memory Retrieval with Source-Preserving Evidence},
+  author = {Anonymous},
+  year   = {2026},
+  note   = {Work in progress}
+}
+```
+
+---
+
+## License
+
+This project is released under the Apache-2.0 License.
