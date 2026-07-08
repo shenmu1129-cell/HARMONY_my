@@ -156,6 +156,70 @@ def judged_avg(rows: Sequence[Dict[str, Any]]) -> float | str:
     return sum(judged) / len(judged)
 
 
+def rebuild_stratified_split(examples: Sequence[Any], train_size: int, base_train_size: int) -> Tuple[List[Any], List[Any]]:
+    base_train = list(examples[: min(base_train_size, train_size, len(examples))])
+    selected_ids = {ex.qid for ex in base_train}
+    groups: Dict[str, List[Any]] = {}
+    for ex in examples[len(base_train) :]:
+        groups.setdefault(str(ex.qtype), []).append(ex)
+    ordered_types = sorted(groups, key=lambda key: (0 if "multi" in key else 1 if "temporal" in key else 2, key))
+    train = list(base_train)
+    while len(train) < min(train_size, len(examples)):
+        progressed = False
+        for qtype in ordered_types:
+            bucket = groups.get(qtype) or []
+            while bucket and bucket[0].qid in selected_ids:
+                bucket.pop(0)
+            if not bucket:
+                continue
+            ex = bucket.pop(0)
+            train.append(ex)
+            selected_ids.add(ex.qid)
+            progressed = True
+            if len(train) >= train_size:
+                break
+        if not progressed:
+            break
+    test = [ex for ex in examples if ex.qid not in selected_ids]
+    return train, test
+
+
+def interleave_by_qtype(examples: Sequence[Any]) -> List[Any]:
+    groups: Dict[str, List[Any]] = {}
+    for ex in examples:
+        groups.setdefault(str(ex.qtype), []).append(ex)
+    ordered_types = sorted(groups, key=lambda key: (0 if "temporal" in key else 1 if "multi" in key else 2, key))
+    out: List[Any] = []
+    while True:
+        progressed = False
+        for qtype in ordered_types:
+            bucket = groups.get(qtype) or []
+            if not bucket:
+                continue
+            out.append(bucket.pop(0))
+            progressed = True
+        if not progressed:
+            break
+    return out
+
+
+def clone_with_method(ret: ProfileRetrievalResult, method_name: str) -> ProfileRetrievalResult:
+    debug = [dict(item) for item in ret.debug_scores]
+    if debug:
+        debug[0]["method"] = method_name
+    return ProfileRetrievalResult(
+        query=ret.query,
+        channel=method_name,
+        selected_edges=ret.selected_edges,
+        selected_facts=ret.selected_facts,
+        score=ret.score,
+        tokens=ret.tokens,
+        fallback_used=ret.fallback_used,
+        sufficient=ret.sufficient,
+        debug_scores=debug,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
@@ -163,6 +227,9 @@ def main() -> None:
     parser.add_argument("--max-examples", type=int, default=40)
     parser.add_argument("--train-size", type=int, default=10)
     parser.add_argument("--max-llm-judge", type=int, default=10)
+    parser.add_argument("--stratified-rebuild", action="store_true")
+    parser.add_argument("--base-train-size", type=int, default=10)
+    parser.add_argument("--interleave-test", action="store_true")
     parser.add_argument("--reader-model", default="deepseek-chat")
     parser.add_argument("--judge-model", default="deepseek-chat")
     parser.add_argument("--reader-mode", default="temporal")
@@ -174,8 +241,13 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     examples = load_examples(Path(args.data), max_examples=args.max_examples)
-    train = examples[: min(args.train_size, len(examples))]
-    test = examples[min(args.train_size, len(examples)) :]
+    if args.stratified_rebuild:
+        train, test = rebuild_stratified_split(examples, args.train_size, args.base_train_size)
+    else:
+        train = examples[: min(args.train_size, len(examples))]
+        test = examples[min(args.train_size, len(examples)) :]
+    if args.interleave_test:
+        test = interleave_by_qtype(test)
     actions = ablation_actions()
     qwen_embed = QwenEmbeddingClient(base_url=args.qwen_embedding_url)
     qwen_reranker = QwenRerankerClient(base_url=args.qwen_reranker_url) if args.use_qwen_reranker else None
@@ -206,8 +278,16 @@ def main() -> None:
             method_runs.append(("Full-HG-RL-4A", full_ret))
             method_runs.append(("NoSourcePreserve-SummaryLeaf", to_summary_leaf(full_ret)))
 
+            fixed_rets: Dict[str, ProfileRetrievalResult] = {}
             for action in actions:
-                method_runs.append((f"NoRL-Fixed-{action.name}", retrieve_full(ex, memory, action, qwen_embed, qwen_reranker, f"NoRL-Fixed-{action.name}")))
+                method_name = f"NoRL-Fixed-{action.name}"
+                fixed_ret = retrieve_full(ex, memory, action, qwen_embed, qwen_reranker, method_name)
+                fixed_rets[action.name] = fixed_ret
+                method_runs.append((method_name, fixed_ret))
+
+            rule_action = "A3-recall" if "multi" in ex.qtype else "A1-compact"
+            if rule_action in fixed_rets:
+                method_runs.append(("QTypeRule-A1Temp-A3Multi", clone_with_method(fixed_rets[rule_action], "QTypeRule-A1Temp-A3Multi")))
 
             method_runs.append(("NoHyperedge-FlatRRF", retrieve_flat_rrf(ex, memory, actions[2], qwen_embed, qwen_reranker)))
 
@@ -260,6 +340,13 @@ def main() -> None:
         )
     write_csv(out_dir / "module_ablation_compare.csv", extra_rows)
     (out_dir / "action_counts.json").write_text(json.dumps(action_counts, ensure_ascii=False, indent=2), encoding="utf-8")
+    split_info = {
+        "train_qtypes": {qtype: sum(1 for ex in train if ex.qtype == qtype) for qtype in sorted({ex.qtype for ex in train})},
+        "test_qtypes": {qtype: sum(1 for ex in test if ex.qtype == qtype) for qtype in sorted({ex.qtype for ex in test})},
+        "train_qids": [ex.qid for ex in train],
+        "test_qids": [ex.qid for ex in test],
+    }
+    (out_dir / "split_info.json").write_text(json.dumps(split_info, ensure_ascii=False, indent=2), encoding="utf-8")
     print((out_dir / "module_ablation_summary.csv").read_text(encoding="utf-8"))
     print("ACTION_COUNTS", json.dumps(action_counts, ensure_ascii=False))
 
