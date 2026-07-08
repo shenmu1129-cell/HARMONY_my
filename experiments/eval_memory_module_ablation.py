@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import statistics
 import time
 from pathlib import Path
@@ -203,6 +204,55 @@ def interleave_by_qtype(examples: Sequence[Any]) -> List[Any]:
     return out
 
 
+def random_matched_split(
+    examples: Sequence[Any],
+    train_size: int,
+    test_size: int,
+    seed: int,
+) -> Tuple[List[Any], List[Any]]:
+    rng = random.Random(seed)
+    pool = list(examples)
+    rng.shuffle(pool)
+    train = pool[: min(train_size, len(pool))]
+    train_ids = {ex.qid for ex in train}
+    remaining = [ex for ex in pool if ex.qid not in train_ids]
+    train_counts: Dict[str, int] = {}
+    for ex in train:
+        train_counts[str(ex.qtype)] = train_counts.get(str(ex.qtype), 0) + 1
+    total_train = max(1, len(train))
+    desired = {
+        qtype: int(round(test_size * count / total_train))
+        for qtype, count in train_counts.items()
+    }
+    while sum(desired.values()) > test_size:
+        qtype = max(desired, key=lambda key: desired[key])
+        desired[qtype] -= 1
+    while sum(desired.values()) < test_size and desired:
+        qtype = max(train_counts, key=lambda key: train_counts[key] / total_train - desired.get(key, 0) / max(1, test_size))
+        desired[qtype] = desired.get(qtype, 0) + 1
+
+    by_type: Dict[str, List[Any]] = {}
+    for ex in remaining:
+        by_type.setdefault(str(ex.qtype), []).append(ex)
+    test: List[Any] = []
+    used = set()
+    for qtype, want in desired.items():
+        bucket = by_type.get(qtype, [])
+        take = bucket[:want]
+        test.extend(take)
+        used.update(ex.qid for ex in take)
+    if len(test) < min(test_size, len(remaining)):
+        for ex in remaining:
+            if ex.qid in used:
+                continue
+            test.append(ex)
+            used.add(ex.qid)
+            if len(test) >= test_size:
+                break
+    rng.shuffle(test)
+    return train, test[:test_size]
+
+
 def clone_with_method(ret: ProfileRetrievalResult, method_name: str) -> ProfileRetrievalResult:
     debug = [dict(item) for item in ret.debug_scores]
     if debug:
@@ -230,6 +280,9 @@ def main() -> None:
     parser.add_argument("--stratified-rebuild", action="store_true")
     parser.add_argument("--base-train-size", type=int, default=10)
     parser.add_argument("--interleave-test", action="store_true")
+    parser.add_argument("--random-matched-split", action="store_true")
+    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--test-size", type=int, default=0)
     parser.add_argument("--reader-model", default="deepseek-chat")
     parser.add_argument("--judge-model", default="deepseek-chat")
     parser.add_argument("--reader-mode", default="temporal")
@@ -241,7 +294,10 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     examples = load_examples(Path(args.data), max_examples=args.max_examples)
-    if args.stratified_rebuild:
+    if args.random_matched_split:
+        requested_test_size = args.test_size or max(0, len(examples) - args.train_size)
+        train, test = random_matched_split(examples, args.train_size, requested_test_size, args.random_seed)
+    elif args.stratified_rebuild:
         train, test = rebuild_stratified_split(examples, args.train_size, args.base_train_size)
     else:
         train = examples[: min(args.train_size, len(examples))]
