@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -1066,6 +1067,23 @@ def summarize(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(out, key=lambda x: (x["llm_judge_accuracy"], x["fact_hit"], x["session_hit"]), reverse=True)
 
 
+def random_train_test_split(examples: Sequence[LongMemExample], train_size: int, seed: int) -> Tuple[List[LongMemExample], List[LongMemExample]]:
+    rng = random.Random(seed)
+    shuffled = list(examples)
+    rng.shuffle(shuffled)
+    train = shuffled[: min(train_size, len(shuffled))]
+    train_ids = {ex.qid for ex in train}
+    test = [ex for ex in shuffled if ex.qid not in train_ids]
+    return train, test
+
+
+def qtype_counts(examples: Sequence[LongMemExample]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for ex in examples:
+        counts[ex.qtype] = counts.get(ex.qtype, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
@@ -1082,13 +1100,36 @@ def main() -> None:
     parser.add_argument("--qwen-reranker-url", default=os.getenv("RERANKER_BASE_URL", "http://localhost:12810"))
     parser.add_argument("--use-qwen-reranker", action="store_true")
     parser.add_argument("--skip-abs", action="store_true")
+    parser.add_argument("--random-split", action="store_true")
+    parser.add_argument("--random-seed", type=int, default=42)
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     examples = load_examples(Path(args.data), max_examples=args.max_examples, start_index=args.start_index, skip_abs=args.skip_abs)
-    train = examples[: min(args.train_size, len(examples))]
-    test = examples[min(args.train_size, len(examples)) :]
+    if args.random_split:
+        train, test = random_train_test_split(examples, args.train_size, args.random_seed)
+    else:
+        train = examples[: min(args.train_size, len(examples))]
+        test = examples[min(args.train_size, len(examples)) :]
+    (out_dir / "split_info.json").write_text(
+        json.dumps(
+            {
+                "random_split": bool(args.random_split),
+                "random_seed": args.random_seed,
+                "num_examples": len(examples),
+                "train_size": len(train),
+                "test_size": len(test),
+                "train_qtypes": qtype_counts(train),
+                "test_qtypes": qtype_counts(test),
+                "train_qids": [ex.qid for ex in train],
+                "test_qids": [ex.qid for ex in test],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     methods = [
         MethodConfig("Oracle-all-turns", graph_gate="oracle_all", top_k_facts=32, max_tokens=1400),
