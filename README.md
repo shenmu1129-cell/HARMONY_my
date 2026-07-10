@@ -1,200 +1,113 @@
-# HyperMem: Hypergraph Memory for Long-Term Conversations
+# HARMONY-Mem
 
-<p align="center">
-  <a href="#"><img src="https://img.shields.io/badge/paper-ACL%202026-b31b1b.svg"></a>
-  <a href="#"><img src="https://img.shields.io/badge/python-3.12+-blue.svg"></a>
-</p>
+HARMONY-Mem is the current long-term conversational-memory retrieval framework in this repository. It keeps HyperMem's hierarchical memory organisation, then adds source-preserving evidence, role-conditioned behavioural hyperedges, and a recall-safe contextual-bandit router that chooses the retrieval budget per query.
 
-Experimental implementation of **HyperMem: Hypergraph Memory for Long-Term Conversations**.
+The research question is practical: retain strong answer accuracy while controlling the evidence-token budget and retrieval latency.
 
-Long-term memory for conversational agents requires modelling *high-order associations*, i.e., joint dependencies among multiple related episodes and facts, which pairwise relations in existing RAG and graph-based memory systems cannot capture. HyperMem addresses this by structuring memory as a three-level hypergraph (**topics → episodes → facts**) connected through weighted hyperedges, and retrieving information via a coarse-to-fine top-down traversal.
+## Current Framework
 
-On the LoCoMo benchmark, HyperMem reaches **92.73% LLM-as-a-judge accuracy**, outperforming the strongest RAG baseline (HyperGraphRAG, 86.49%) by **+6.24%** and the strongest memory system (MemOS, 75.80%) by **+16.93%**.
+```text
+LoCoMo dialogue rows
+  -> source-preserving facts (row/date/role/raw text)
+  -> topic / episode / fact hierarchy + role-conditioned hyperedges
+  -> Qwen dense retrieval + BM25/RRF fusion + Qwen reranking
+  -> contextual-bandit action router
+  -> compact, balanced, or recall-oriented evidence packing
+  -> gpt-4.1-mini answer generation
+  -> gpt-4o-mini LLM-as-a-judge evaluation
+```
 
----
+The router selects from a small, cost-aware action space:
 
-## Method
+| Action | Role handling | Retrieval budget | Intended use |
+| --- | --- | --- | --- |
+| `RoleCompact` | soft role-aware routing | low | simple role-specific questions |
+| `RoleBalanced` | soft role-aware routing | medium | typical role-specific questions |
+| `FullCompact` | global retrieval | low | simple non-role questions |
+| `FullBalanced` | global retrieval | medium | general questions |
+| `FullRecall` | global retrieval | high | temporal, multi-hop, or uncertain questions |
 
-<p align="center"><em>Three-level hypergraph with hyperedges linking nodes of the same level.</em></p>
+Role information is a routing signal, not a hard filter. This prevents cross-speaker evidence from being removed before ranking. Final evidence always points back to the original dialogue row, rather than relying only on generated summaries.
 
-Given a dialogue stream $X = \{x_t\}_{t=1}^T$, HyperMem constructs a memory hypergraph
+## Evaluation Metrics
 
-$$\mathcal{H} = (\mathcal{V}^T \cup \mathcal{V}^E \cup \mathcal{V}^F,\; \mathcal{E}^E \cup \mathcal{E}^F),$$
+The current report intentionally keeps three primary metrics:
 
-where $\mathcal{V}^T, \mathcal{V}^E, \mathcal{V}^F$ denote topic, episode and fact nodes respectively. Episode hyperedges $\mathcal{E}^E$ connect episode nodes under the same topic with weights $w^E \in [0,1]$; fact hyperedges $\mathcal{E}^F$ connect fact nodes belonging to the same episode with weights $w^F \in [0,1]$.
+- `llm_acc`: answer correctness judged by an LLM.
+- `retrieval_tokens`: tokens in the retrieved evidence sent to the answer model.
+- `retrieval_latency_ms`: retrieval latency only; it excludes answer-generation and judge latency.
 
-| Level | Node       | Semantics                                                     |
-|:-----:|:-----------|:--------------------------------------------------------------|
-| L3    | **Topic**  | Long-horizon theme grouping topically related episodes        |
-| L2    | **Episode**| Temporally contiguous dialogue segment describing one event   |
-| L1    | **Fact**   | Atomic queryable knowledge unit extracted from an episode     |
+The latest HARMONY LoCoMo run used Qwen3 embedding and reranking, 60 training questions, 80 test questions, source-preserving evidence, and `gpt-4o-mini` for the original reader/judge run.
 
-### Hypergraph Construction
+| Setting | Questions | `llm_acc` | `retrieval_tokens` | `retrieval_latency_ms` |
+| --- | ---: | ---: | ---: | ---: |
+| Strict original evaluation | 80 | 0.7625 | 774.1 | 3463.2 |
+| HyperMem-aligned answer/judge protocol | 78, category 5 excluded | 0.9744 | 771.6 | 3454.5 |
 
-1. **Episode Detection**: an LLM-driven streaming boundary detector partitions the raw dialogue into semantically complete *episodes*, each summarised and timestamped.
-2. **Topic Aggregation**: streaming topic matching against historical topics lazily groups related episodes under shared *topics*; new topics are created when no sufficient match exists.
-3. **Fact Extraction**: atomic *facts* are extracted from each episode (potential queries, keywords, summary), then bound to facts in the same episode via a weighted hyperedge.
+The second row regenerates answers from the same retrieved evidence with `gpt-4.1-mini` and HyperMem's CoT answer prompt, then uses the HyperMem-style `gpt-4o-mini` judge. It is a same-split, final-stage protocol alignment check, not a fresh full-benchmark reproduction or a directly comparable paper score.
 
-### Hypergraph Embedding Propagation
+## Setup
 
-Node embeddings are refined by aggregating information from incident hyperedges. A hyperedge embedding is computed as an attention-weighted sum of its member nodes,
-
-$$\mathbf{h}_e = \sum_{v \in V(e)} \alpha_{e,v} \mathbf{h}_v,\quad \alpha_{e,v} = \frac{\exp(w_{e,v})}{\sum_{u \in V(e)} \exp(w_{e,u})},$$
-
-and each node is updated as $\mathbf{h}'_v = \mathbf{h}_v + \lambda \cdot \mathrm{Agg}_{e \in \mathcal{N}(v)}(\mathbf{h}_e)$ with $\lambda = 0.5$.
-
-### Coarse-to-Fine Retrieval
-
-For a query $q$, retrieval proceeds top-down:
-
-* **Stage 1, Topic Retrieval**: BM25 and dense rankings are fused by Reciprocal Rank Fusion,
-
-  $$\mathrm{RRF}(d) = \sum_{m=1}^{M} \frac{1}{k + \mathrm{rank}_m(d)},$$
-
-  and the top-$k^T$ topics are kept after optional reranking.
-* **Stage 2, Episode Retrieval**: episodes in the topic subgraph are scored and the top-$k^E$ are retained.
-* **Stage 3, Fact Retrieval**: facts linked to the retained episodes are scored and the top-$k^F$ are used as evidence.
-
-The final answer is generated by an LLM conditioned on the retrieved episodes (with their summaries) and facts.
-
----
-
-## Installation
-
-HyperMem is tested with Python 3.12 and CUDA 12.1.
+Python 3.12 is recommended. Local development in this workspace uses the `wwt310` environment.
 
 ```bash
-git clone git@github.com:shenmu1129-cell/memory_my.git
-cd HyperMem
-
-conda create -n hypermem python=3.12 -y
-conda activate hypermem
-pip install -r requirements.txt
+conda run -n wwt310 python -m pip install -r requirements.txt
+export OPENAI_API_KEY="sk-..."
+export EMBEDDING_BASE_URL="http://localhost:11810/v1/embeddings"
+export RERANKER_BASE_URL="http://localhost:12810"
 ```
 
-### Environment variables
-
-Create a `.env` file at the repository root:
+The main LoCoMo experiment expects Qwen3-Embedding-4B and Qwen3-Reranker-4B services compatible with those endpoints. The API smoke test never stores a key in source control:
 
 ```bash
-# LLM backend (OpenAI-compatible; we use OpenRouter in the paper)
-OPENROUTER_API_KEY=sk-...
-
-# Local model endpoints
-EMBEDDING_BASE_URL=http://localhost:11810/v1/embeddings
-RERANKER_BASE_URL=http://localhost:12810
+OPENAI_API_KEY="sk-..." conda run -n wwt310 python examples/openai_api_smoke_test.py --model gpt-4o-mini
 ```
 
-### Local model services
+## Run HARMONY-Mem
 
-HyperMem uses **Qwen3-Embedding-4B** for semantic encoding and **Qwen3-Reranker-4B** for reranking. Both are served via vLLM:
+Retrieval-only smoke test:
 
 ```bash
-bash scripts/serve_embedding.sh   # GPUs 0-3, port 11810
-bash scripts/serve_reranker.sh    # GPUs 4-7, port 12810
+conda run -n wwt310 python experiments/eval_locomo_comparison.py \
+  --data data/locomo10.json \
+  --output-dir outputs/harmony_smoke \
+  --max-examples 60 \
+  --train-size 30 \
+  --test-size 30 \
+  --methods HARMONY-Mem \
+  --use-qwen-reranker \
+  --skip-empty-gold
 ```
 
----
-
-## Reproducing the paper
-
-The full LoCoMo evaluation pipeline is launched with a single command:
+Run answer generation and judging on the retrieved trace:
 
 ```bash
-bash scripts/run_eval.sh
+OPENAI_API_KEY="sk-..." conda run -n wwt310 python experiments/rejudge_trace_hypermem_style.py \
+  --trace outputs/harmony_smoke/trace.jsonl \
+  --output-dir outputs/harmony_hypermem_style \
+  --skip-category-5 \
+  --reader-model gpt-4.1-mini \
+  --judge-model gpt-4o-mini
 ```
 
-The script sequentially runs six stages; all artefacts are written under `results/<experiment_name>/`.
+`experiments/eval_locomo_comparison.py` contains the HARMONY router and lightweight LoCoMo-compatible comparison baselines. `experiments/rejudge_trace_hypermem_style.py` reruns only the final answer/judge stage over an existing trace, so retrieval and router results are unchanged.
 
-| Stage | Script                              | Purpose                                         |
-|:-----:|:------------------------------------|:------------------------------------------------|
-| 1     | `stage1_memory_extraction.py`       | Episode detection from raw dialogues            |
-| 2     | `stage2_hypergraph_extraction.py`   | Topic aggregation + fact extraction + hypergraph construction |
-| 3     | `stage3_hypergraph_index.py`        | BM25 and dense indices over the hypergraph      |
-| 4     | `stage4_hypergraph_retrieval.py`    | Top-down hierarchical retrieval                 |
-| 5     | `stage5_response.py`                | LLM answer generation from retrieved evidence   |
-| 6     | `stage6_eval.py`                    | LLM-as-judge evaluation (3 rounds, averaged)    |
+## Repository Layout
 
-Individual stages can be run via:
-
-```bash
-python hypermem/main/eval.py --stages 4 5 6
+```text
+hypermem/
+  profile_centric_hypergraph.py  # profile-hyperedge memory primitives
+  query_router.py                # deterministic profile/episodic query router
+  main/                          # original HyperMem six-stage pipeline
+experiments/
+  eval_locomo_comparison.py      # HARMONY-Mem LoCoMo runner
+  eval_longmemeval_mini.py       # reusable retrieval/evaluation components
+  eval_rl_memory_complexity.py   # router utilities
+  rejudge_trace_hypermem_style.py# protocol-aligned final-stage re-evaluation
+docs/
+  locomo_experiments.md          # comparison methodology and commands
+examples/
+  openai_api_smoke_test.py       # environment-variable-only OpenAI API test
 ```
 
-### Configuration
-
-All hyper-parameters live in [`hypermem/config.py`](hypermem/config.py) and can be overridden through environment variables:
-
-```bash
-export HYPERMEM_EXPERIMENT_NAME="HyperMem-v3"
-export HYPERMEM_USE_RERANKER=false
-export HYPERMEM_INITIAL_CANDIDATES=100       # pre-fusion candidate pool
-export HYPERMEM_TOPIC_TOP_K=15               # k^T
-export HYPERMEM_EPISODE_TOP_K=25             # k^E
-export HYPERMEM_FACT_TOP_K=30                # k^F
-```
-
-This setting uses $\lambda = 0.5$, $(k^T, k^E, k^F) = (15, 25, 30)$, BM25 + dense retrieval with RRF ($k = 60$), and sum aggregation for hyperedge embedding propagation.
-
----
-
-## Results
-
-### LoCoMo benchmark
-
-Accuracy is reported as the LLM-as-judge score (GPT-4o-mini), averaged over 3 evaluation rounds.
-
-| Method              | Single-hop | Multi-hop | Temporal | Open Domain | **Overall** |
-|:--------------------|:----------:|:---------:|:--------:|:-----------:|:-----------:|
-| GraphRAG            |   79.55    |   54.96   |  50.16   |    58.33    |    67.60    |
-| LightRAG            |   86.68    |   84.04   |  60.75   |    71.88    |    79.87    |
-| HippoRAG 2          |   86.44    |   75.89   |  78.50   |    66.67    |    81.62    |
-| HyperGraphRAG       |   90.61    |   80.85   |  85.36   |    70.83    |    86.49    |
-| OpenAI              |   63.79    |   42.92   |  21.71   |    63.22    |    52.90    |
-| LangMem             |   62.23    |   47.92   |  23.43   |    72.20    |    58.10    |
-| Zep                 |   61.70    |   41.35   |  49.31   |    76.60    |    65.99    |
-| A-Mem               |   39.79    |   18.85   |  49.91   |    54.05    |    48.38    |
-| Mem0                |   67.13    |   51.15   |  55.51   |    72.93    |    66.88    |
-| Mem0$^g$            |   65.71    |   47.19   |  58.13   |    75.71    |    68.44    |
-| MIRIX               |   85.11    |   83.70   |  88.39   |    65.62    |    85.38    |
-| Memobase            |   73.12    |   64.65   |  81.20   |    53.12    |    72.01    |
-| MemU                |   66.34    |   63.12   |  27.10   |    50.56    |    56.55    |
-| MemOS               |   81.09    |   67.49   |  75.18   |    55.90    |    75.80    |
-| **HyperMem (Ours)** | **96.08**  | **93.62** |**89.72** |    70.83    |  **92.73**  |
-
----
-
-## Project Structure
-
-```
-HyperMem/
-├── hypermem/
-│   ├── config.py                 # Experiment configuration
-│   ├── types.py                  # Episode / Topic / Fact data classes
-│   ├── structure.py              # Hypergraph nodes and hyperedges
-│   ├── extractors/               # LLM-driven extraction modules
-│   │   ├── episode_extractor.py
-│   │   ├── topic_extractor.py
-│   │   ├── fact_extractor.py
-│   │   └── hypergraph_extractor.py
-│   ├── llm/                      # OpenAI-compatible LLM / embedding / reranker clients
-│   ├── prompts/                  # Prompt templates (episode / topic / fact / answer)
-│   ├── utils/                    # Utility functions
-│   └── main/                     # Six-stage pipeline entry points
-├── scripts/
-│   ├── run_eval.sh               # End-to-end evaluation driver
-│   ├── serve_embedding.sh        # Qwen3-Embedding-4B server
-│   └── serve_reranker.sh         # Qwen3-Reranker-4B server
-├── data/                         # LoCoMo-10 and auxiliary benchmarks
-├── results/                      # Per-experiment artefacts
-├── requirements.txt
-└── README.md
-```
-
-Each experiment directory under `results/` contains the extracted `episodes/`, `topics/`, `facts/`, the built `hypergraphs/`, `bm25_index/`, `vectors/`, along with `search_results.json`, `retrieval_logs.json`, `responses.json`, and the final `judged.json`.
-
----
-
-## Repository
-
-Project link: git@github.com:shenmu1129-cell/memory_my.git
+Generated traces, caches, model outputs, and API keys are intentionally excluded from Git.
