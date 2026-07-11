@@ -1,0 +1,16 @@
+{
+  "large:preference:role": {
+    "RoleBalanced": 0.5455,
+    "RoleRecall": 0.375,
+    "FullBalanced": 0.4406,
+    "FullRecall": 0.7222,
+    "FullBroad": 0.5
+  },
+  "large:temporal:role": {
+    "RoleBalanced": 0.5455,
+    "RoleRecall": 0.6429,
+    "FullBalanced": 0.6154,
+    "FullRecall": 0.7763,
+    "FullBroad": 0.5
+  }
+}

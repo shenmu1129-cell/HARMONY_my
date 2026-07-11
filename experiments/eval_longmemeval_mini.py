@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from openai import OpenAI  # noqa: E402
+from openai import OpenAI, OpenAIError  # noqa: E402
 
 from hypermem import load_runtime_env  # noqa: E402
 from hypermem.profile_centric_hypergraph import (  # noqa: E402
@@ -798,8 +798,17 @@ class LLMClient:
         }
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
-        resp = self.client.chat.completions.create(**kwargs)
-        return resp.choices[0].message.content or ""
+        last_exc: Exception | None = None
+        for attempt in range(5):
+            try:
+                resp = self.client.chat.completions.create(**kwargs)
+                return resp.choices[0].message.content or ""
+            except OpenAIError as exc:
+                last_exc = exc
+                wait_s = min(60, 5 * (2**attempt))
+                print(f"[warn] LLM request failed on attempt {attempt + 1}/5: {exc}; retrying in {wait_s}s", flush=True)
+                time.sleep(wait_s)
+        raise RuntimeError(f"LLM request failed after retries: {last_exc}") from last_exc
 
 
 def sorted_evidence_facts(ret: ProfileRetrievalResult) -> List[ProfileFact]:
@@ -980,6 +989,11 @@ def generate_and_judge(
         "Answer the LongMemEval question using only the retrieved conversation evidence. "
         "Use the temporal calculation notes to compare dates, relative times, durations, and clock times. "
         "If a turn says a relative time such as last week, yesterday, or years ago, anchor it to that turn's session date. "
+        "For when/date questions, output the resolved absolute date or month whenever the evidence provides a session date; do not answer only with a relative phrase such as yesterday or last week. "
+        "For list questions, include every item supported by the evidence and avoid dropping later items from the same evidence block. "
+        "Do not merge unrelated candidate answers from different evidence blocks unless the question explicitly asks for all, every, both, or multiple items. "
+        "When several evidence blocks mention similar entities or events, choose the block that most directly matches the wording and time context of the question. "
+        "For what/who questions, answer the exact entity, object, event, pet, activity, or identity requested rather than a broader description. "
         "It is acceptable to answer with a relative phrase such as \"the week before 9 June 2023\" when that is the most faithful answer. "
         "When the evidence contains a direct clue, do not answer \"I don't know\" just because the exact calendar date is implicit. "
         "You must output one non-empty short phrase, preserving important qualifiers such as who the career or event is for. "
@@ -987,7 +1001,9 @@ def generate_and_judge(
         if reader_mode in {"temporal", "temporal_strict"}
         else
         "Answer the LongMemEval question using only the retrieved conversation evidence. "
-        "Do any date/count comparison needed. You must output a non-empty short phrase. "
+        "Do any date/count comparison needed. For list questions, include every item supported by the evidence. "
+        "Do not merge unrelated candidate answers unless the question asks for all or multiple items. "
+        "You must output a non-empty short phrase. "
         "If the evidence is insufficient, output \"I don't know\"."
     )
     answer_prompt = (

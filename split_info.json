@@ -1,0 +1,25 @@
+{
+  "max_examples": 20,
+  "train_size": 4,
+  "test_size": 2,
+  "seed": 42,
+  "train_qtypes": {
+    "locomo_category_1": 2,
+    "locomo_category_2": 1,
+    "locomo_category_3": 1
+  },
+  "test_qtypes": {
+    "locomo_category_1": 1,
+    "locomo_category_2": 1
+  },
+  "train_qids": [
+    "conv-26::qa_019",
+    "conv-26::qa_005",
+    "conv-26::qa_014",
+    "conv-26::qa_004"
+  ],
+  "test_qids": [
+    "conv-26::qa_009",
+    "conv-26::qa_013"
+  ]
+}

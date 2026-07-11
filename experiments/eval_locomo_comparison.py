@@ -55,11 +55,9 @@ def infer_query_roles(question: str, rows: Sequence[Dict[str, Any]]) -> List[str
 
 def role_gated_rows(question: str, rows: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
     roles = infer_query_roles(question, rows)
-    if not roles:
-        return list(rows), []
-    role_set = set(roles)
-    gated = [dict(row) for row in rows if str(row.get("role") or "").strip() in role_set]
-    return gated or list(rows), roles
+    # Keep all rows. Hard role filtering dropped answer evidence when the answer was
+    # said by the conversation partner; role actions are now soft routing choices.
+    return list(rows), roles
 
 
 def query_snippet(text: str, query: str, max_words: int = 96) -> str:
@@ -122,7 +120,12 @@ def source_snippet_result(
 
 def evidence_block_display_first(ret: ProfileRetrievalResult, max_chars: int = 4200) -> str:
     lines: List[str] = []
-    for i, fact in enumerate(base.sorted_evidence_facts(ret)[:16], start=1):
+    facts = (
+        list(ret.selected_facts)
+        if any((fact.metadata or {}).get("display_content") for fact in ret.selected_facts)
+        else base.sorted_evidence_facts(ret)
+    )
+    for i, fact in enumerate(facts[:12], start=1):
         meta = fact.metadata or {}
         text = str(meta.get("display_content") or meta.get("raw_content") or fact.content).replace("\n", " ").strip()
         if meta.get("display_content"):
@@ -141,29 +144,34 @@ generate_and_judge.__globals__["evidence_block"] = evidence_block_display_first
 def action_space() -> List[RetrievalAction]:
     return [
         RetrievalAction(
-            "RoleBalanced",
-            MethodConfig("RoleBalanced", graph_gate="hypermem_full", top_k_facts=20, max_tokens=1250, initial_candidates=70, topic_top_k=6, episode_top_k=12, lambda_prop=0.5),
+            "RoleCompact",
+            MethodConfig("RoleCompact", graph_gate="hypermem_full", top_k_facts=10, max_tokens=650, initial_candidates=55, topic_top_k=5, episode_top_k=10, lambda_prop=0.5),
             role_gate=True,
+            snippet_words=72,
         ),
         RetrievalAction(
-            "RoleRecall",
-            MethodConfig("RoleRecall", graph_gate="hypermem_full", top_k_facts=24, max_tokens=1500, initial_candidates=85, topic_top_k=8, episode_top_k=16, lambda_prop=0.5),
+            "RoleBalanced",
+            MethodConfig("RoleBalanced", graph_gate="hypermem_full", top_k_facts=14, max_tokens=850, initial_candidates=70, topic_top_k=6, episode_top_k=12, lambda_prop=0.5),
             role_gate=True,
+            snippet_words=80,
+        ),
+        RetrievalAction(
+            "FullCompact",
+            MethodConfig("FullCompact", graph_gate="hypermem_full", top_k_facts=10, max_tokens=650, initial_candidates=55, topic_top_k=5, episode_top_k=10, lambda_prop=0.5),
+            role_gate=False,
+            snippet_words=72,
         ),
         RetrievalAction(
             "FullBalanced",
-            MethodConfig("FullBalanced", graph_gate="hypermem_full", top_k_facts=20, max_tokens=1250, initial_candidates=70, topic_top_k=6, episode_top_k=12, lambda_prop=0.5),
+            MethodConfig("FullBalanced", graph_gate="hypermem_full", top_k_facts=14, max_tokens=850, initial_candidates=70, topic_top_k=6, episode_top_k=12, lambda_prop=0.5),
             role_gate=False,
+            snippet_words=80,
         ),
         RetrievalAction(
             "FullRecall",
-            MethodConfig("FullRecall", graph_gate="hypermem_full", top_k_facts=24, max_tokens=1500, initial_candidates=85, topic_top_k=8, episode_top_k=16, lambda_prop=0.5),
+            MethodConfig("FullRecall", graph_gate="hypermem_full", top_k_facts=18, max_tokens=1100, initial_candidates=90, topic_top_k=8, episode_top_k=16, lambda_prop=0.5),
             role_gate=False,
-        ),
-        RetrievalAction(
-            "FullBroad",
-            MethodConfig("FullBroad", graph_gate="hypermem_full", top_k_facts=28, max_tokens=1700, initial_candidates=100, topic_top_k=10, episode_top_k=18, lambda_prop=0.5),
-            role_gate=False,
+            snippet_words=88,
         ),
     ]
 
@@ -199,20 +207,16 @@ class ActionBandit:
         self.alpha[bucket] = [1.0] * len(self.actions)
         self.beta[bucket] = [1.0] * len(self.actions)
         for i, action in enumerate(self.actions):
-            if "large" in bucket and action.name == "FullRecall":
-                self.alpha[bucket][i] += 0.8
+            if action.name in {"FullCompact", "FullBalanced"}:
+                self.alpha[bucket][i] += 0.3
             if bucket.endswith(":role") and action.role_gate:
-                self.alpha[bucket][i] += 0.2
-            if "multi_count" in bucket and action.name in {"RoleRecall", "FullBroad"}:
-                self.alpha[bucket][i] += 0.8
-            if "temporal" in bucket and action.name in {"FullBalanced", "FullRecall", "RoleRecall"}:
+                self.alpha[bucket][i] += 0.35
+            if "multi_count" in bucket and action.name in {"RoleBalanced", "FullRecall"}:
                 self.alpha[bucket][i] += 0.6
-            if "preference" in bucket and action.name in {"FullBalanced", "FullRecall"}:
+            if "temporal" in bucket and action.name in {"FullBalanced", "FullRecall", "RoleBalanced"}:
                 self.alpha[bucket][i] += 0.4
-            if "temporal" in bucket and action.name == "FullRecall":
-                self.alpha[bucket][i] += 0.4
-            if "preference" in bucket and action.name == "FullRecall":
-                self.alpha[bucket][i] += 0.4
+            if "preference" in bucket and action.name in {"FullCompact", "FullBalanced", "RoleCompact"}:
+                self.alpha[bucket][i] += 0.45
 
     def select(self, example: Any, train: bool) -> int:
         bucket = self.bucket(example)
@@ -243,17 +247,30 @@ class ActionBandit:
 def reward(example: Any, metrics: Dict[str, Any], ret: ProfileRetrievalResult) -> float:
     comp = complexity_bin(example, memory_stats(example))
     latency = float(ret.debug_scores[0].get("latency_ms", 0.0)) if ret.debug_scores else 0.0
+    first_answer_rank = None
+    for idx, fact in enumerate(ret.selected_facts, start=1):
+        if fact.metadata.get("has_answer"):
+            first_answer_rank = idx
+            break
     if comp == "multi_count":
-        score = 0.20 * metrics["fact_hit"] + 0.45 * metrics["answer_turn_recall"] + 0.35 * metrics["all_answer_turns_hit"]
-        token_scale = 2600.0
+        score = 0.18 * metrics["fact_hit"] + 0.50 * metrics["answer_turn_recall"] + 0.24 * metrics["all_answer_turns_hit"]
+        token_target = 1100.0
     elif comp == "temporal":
-        score = 0.25 * metrics["fact_hit"] + 0.45 * metrics["answer_turn_recall"] + 0.30 * metrics["all_answer_turns_hit"]
-        token_scale = 2200.0
+        score = 0.20 * metrics["fact_hit"] + 0.50 * metrics["answer_turn_recall"] + 0.22 * metrics["all_answer_turns_hit"]
+        token_target = 950.0
     else:
-        score = 0.45 * metrics["fact_hit"] + 0.35 * metrics["answer_turn_recall"] + 0.20 * metrics["all_answer_turns_hit"]
-        token_scale = 1700.0
-    score -= min(0.18, ret.tokens / token_scale * 0.10)
-    score -= min(0.08, latency / 4000.0 * 0.05)
+        score = 0.30 * metrics["fact_hit"] + 0.46 * metrics["answer_turn_recall"] + 0.16 * metrics["all_answer_turns_hit"]
+        token_target = 800.0
+    if first_answer_rank == 1:
+        score += 0.14
+    elif first_answer_rank is not None and first_answer_rank <= 3:
+        score += 0.09
+    elif first_answer_rank is not None and first_answer_rank <= 5:
+        score += 0.04
+    elif metrics["fact_hit"]:
+        score -= 0.06
+    score -= min(0.22, max(0.0, ret.tokens - token_target) / token_target * 0.16)
+    score -= min(0.08, latency / 5000.0 * 0.05)
     return score
 
 
@@ -554,24 +571,27 @@ def qtype_counts(examples: Sequence[Any]) -> Dict[str, int]:
 def fixed_role_balanced_action() -> RetrievalAction:
     return RetrievalAction(
         "RoleBalanced",
-        MethodConfig("RoleBalanced", graph_gate="hypermem_full", top_k_facts=20, max_tokens=1250, initial_candidates=70, topic_top_k=6, episode_top_k=12, lambda_prop=0.5),
+        MethodConfig("RoleBalanced", graph_gate="hypermem_full", top_k_facts=14, max_tokens=850, initial_candidates=70, topic_top_k=6, episode_top_k=12, lambda_prop=0.5),
         role_gate=True,
+        snippet_words=80,
     )
 
 
 def fixed_no_role_action() -> RetrievalAction:
     return RetrievalAction(
         "FullBalanced",
-        MethodConfig("FullBalanced", graph_gate="hypermem_full", top_k_facts=20, max_tokens=1250, initial_candidates=70, topic_top_k=6, episode_top_k=12, lambda_prop=0.5),
+        MethodConfig("FullBalanced", graph_gate="hypermem_full", top_k_facts=14, max_tokens=850, initial_candidates=70, topic_top_k=6, episode_top_k=12, lambda_prop=0.5),
         role_gate=False,
+        snippet_words=80,
     )
 
 
 def fixed_full_recall_action() -> RetrievalAction:
     return RetrievalAction(
         "FullRecall",
-        MethodConfig("FullRecall", graph_gate="hypermem_full", top_k_facts=24, max_tokens=1500, initial_candidates=85, topic_top_k=8, episode_top_k=16, lambda_prop=0.5),
+        MethodConfig("FullRecall", graph_gate="hypermem_full", top_k_facts=18, max_tokens=1100, initial_candidates=90, topic_top_k=8, episode_top_k=16, lambda_prop=0.5),
         role_gate=False,
+        snippet_words=88,
     )
 
 
@@ -651,12 +671,15 @@ def main() -> None:
     parser.add_argument("--reader-model", default="deepseek-chat")
     parser.add_argument("--judge-model", default="deepseek-chat")
     parser.add_argument("--reader-mode", default="temporal")
+    parser.add_argument("--skip-empty-gold", action="store_true")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     wanted = {m.strip() for m in args.methods.split(",") if m.strip()}
     examples = load_examples(Path(args.data), max_examples=args.max_examples)
+    if args.skip_empty_gold:
+        examples = [ex for ex in examples if str(ex.answer).strip()]
     train, test = split_examples(examples, args.train_size, args.test_size, args.seed)
     (out_dir / "split_info.json").write_text(
         json.dumps(
