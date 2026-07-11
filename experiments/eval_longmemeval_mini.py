@@ -880,11 +880,18 @@ class ThompsonRouter:
 class LLMClient:
     def __init__(self, model: str | None = None) -> None:
         load_runtime_env()
-        api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        requested_model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+        use_openai = requested_model.startswith(("gpt-", "o1", "o3", "o4"))
+        api_key = os.getenv("OPENAI_API_KEY" if use_openai else "DEEPSEEK_API_KEY", "")
         if not api_key:
-            raise RuntimeError("DEEPSEEK_API_KEY is missing")
-        self.client = OpenAI(api_key=api_key, base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
-        self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+            raise RuntimeError("OPENAI_API_KEY is missing" if use_openai else "DEEPSEEK_API_KEY is missing")
+        base_url = (
+            os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+            if use_openai
+            else os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        )
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.model = requested_model
 
     def chat(self, prompt: str, max_tokens: int = 256, json_mode: bool = False) -> str:
         kwargs: Dict[str, Any] = {

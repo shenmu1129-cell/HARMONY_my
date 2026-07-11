@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import csv
 import json
 import os
@@ -16,28 +15,15 @@ from openai import OpenAI, OpenAIError
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-HYPERMEM_ROOT = ROOT / "HyperMem"
-if str(HYPERMEM_ROOT) not in sys.path:
-    sys.path.insert(0, str(HYPERMEM_ROOT))
-
+from hypermem import load_runtime_env  # noqa: E402
 from hypermem.prompts.answer_prompts import ANSWER_PROMPT_NEMORI_COT  # noqa: E402
 
 
 def load_openai_key() -> str:
+    load_runtime_env()
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if key:
         return key
-
-    smoke = ROOT / "HyperMem" / "examples" / "openai_api_smoke_test.py"
-    if smoke.exists():
-        tree = ast.parse(smoke.read_text(encoding="utf-8"))
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == "OPENAI_API_KEY":
-                        value = ast.literal_eval(node.value)
-                        if isinstance(value, str) and value.strip():
-                            return value.strip()
     raise RuntimeError("OPENAI_API_KEY is missing")
 
 
