@@ -9,7 +9,7 @@ import re
 import statistics
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -33,6 +33,18 @@ from eval_longmemeval_mini import (
     write_csv,
 )
 from eval_rl_memory_complexity import complexity_bin, memory_stats, size_bin
+from hypermem.subquery_planner import (
+    ROUTE_GLOBAL_COMPACT,
+    ROUTE_HIERARCHICAL,
+    ROUTE_ROLE_SHORTCUT,
+    ROUTE_ROLE_TEMPORAL,
+    QueryPlan,
+    RouteCandidate,
+    Subquery,
+    candidate_routes,
+    decompose_query,
+    lexical_overlap,
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +94,7 @@ def source_snippet_result(
     query: str,
     method_name: str,
     max_words: int,
+    max_tokens: int | None = None,
 ) -> ProfileRetrievalResult:
     facts: List[ProfileFact] = []
     for fact in ret.selected_facts:
@@ -101,6 +114,16 @@ def source_snippet_result(
                 metadata=meta,
             )
         )
+    if max_tokens is not None:
+        packed: List[ProfileFact] = []
+        used_tokens = 0
+        for fact in facts:
+            fact_tokens = estimate_tokens(fact.content)
+            if packed and used_tokens + fact_tokens > max_tokens:
+                continue
+            packed.append(fact)
+            used_tokens += fact_tokens
+        facts = packed
     debug = [dict(x) for x in ret.debug_scores]
     if debug:
         debug[0]["method"] = method_name
@@ -171,6 +194,12 @@ def action_space() -> List[RetrievalAction]:
             "FullRecall",
             MethodConfig("FullRecall", graph_gate="hypermem_full", top_k_facts=18, max_tokens=1100, initial_candidates=90, topic_top_k=8, episode_top_k=16, lambda_prop=0.5),
             role_gate=False,
+            snippet_words=88,
+        ),
+        RetrievalAction(
+            "RoleTemporal",
+            MethodConfig("RoleTemporal", graph_gate="hypermem_full", top_k_facts=18, max_tokens=1100, initial_candidates=90, topic_top_k=8, episode_top_k=16, lambda_prop=0.5),
+            role_gate=True,
             snippet_words=88,
         ),
     ]
@@ -274,8 +303,61 @@ def reward(example: Any, metrics: Dict[str, Any], ret: ProfileRetrievalResult) -
     return score
 
 
-def split_examples(examples: Sequence[Any], train_size: int, test_size: int, seed: int) -> Tuple[List[Any], List[Any]]:
+def conversation_key(example: Any) -> str:
+    qid = str(example.qid)
+    if "::qa_" in qid:
+        return qid.split("::qa_", 1)[0]
+    if "::" in qid:
+        return qid.split("::", 1)[0]
+    return qid
+
+
+def conversation_balanced_sample(examples: Sequence[Any], max_examples: int, seed: int) -> List[Any]:
+    """Round-robin sample QA items across conversations before applying a cap."""
+    if max_examples <= 0 or len(examples) <= max_examples:
+        return list(examples)
     rng = random.Random(seed)
+    groups: Dict[str, List[Any]] = {}
+    for example in examples:
+        groups.setdefault(conversation_key(example), []).append(example)
+    for items in groups.values():
+        rng.shuffle(items)
+    keys = sorted(groups)
+    rng.shuffle(keys)
+    selected: List[Any] = []
+    while keys and len(selected) < max_examples:
+        next_keys: List[str] = []
+        for key in keys:
+            if groups[key] and len(selected) < max_examples:
+                selected.append(groups[key].pop())
+            if groups[key]:
+                next_keys.append(key)
+        keys = next_keys
+    return selected
+
+
+def split_examples(
+    examples: Sequence[Any],
+    train_size: int,
+    test_size: int,
+    seed: int,
+    split_unit: str = "conversation",
+) -> Tuple[List[Any], List[Any]]:
+    rng = random.Random(seed)
+    if split_unit == "conversation":
+        groups: Dict[str, List[Any]] = {}
+        for example in examples:
+            groups.setdefault(conversation_key(example), []).append(example)
+        group_keys = list(groups)
+        rng.shuffle(group_keys)
+        train: List[Any] = []
+        test: List[Any] = []
+        for key in group_keys:
+            target = train if len(train) < train_size else test
+            target.extend(groups[key])
+            if len(train) >= train_size and len(test) >= test_size:
+                break
+        return train[:train_size], test[:test_size]
     pool = list(examples)
     rng.shuffle(pool)
     train = pool[: min(train_size, len(pool))]
@@ -290,11 +372,21 @@ def run_action(
     method_name: str,
     qwen_embed: QwenEmbeddingClient,
     qwen_reranker: QwenRerankerClient | None,
+    memory: Any | None = None,
+    format_sources: bool = True,
 ) -> ProfileRetrievalResult:
     rows, gated_roles = role_gated_rows(example.question, example.rows) if action.role_gate else (list(example.rows), [])
-    memory = build_memory(rows)
-    ret = retrieve_method(example, memory, action.method, qwen_embed=qwen_embed, qwen_reranker=qwen_reranker)
-    ret = source_snippet_result(ret, example.question, method_name, action.snippet_words)
+    memory = memory or build_memory(rows)
+    ret = retrieve_method(
+        example,
+        memory,
+        action.method,
+        qwen_embed=qwen_embed,
+        qwen_reranker=qwen_reranker,
+        role_hints=gated_roles,
+    )
+    if format_sources:
+        ret = source_snippet_result(ret, example.question, method_name, action.snippet_words, action.method.max_tokens)
     ret.channel = method_name
     if ret.debug_scores:
         ret.debug_scores[0]["method"] = method_name
@@ -302,6 +394,281 @@ def run_action(
         ret.debug_scores[0]["role_gate"] = action.role_gate
         ret.debug_scores[0]["gated_roles"] = ",".join(gated_roles)
     return ret
+
+
+ROUTE_TO_ACTION = {
+    ROUTE_GLOBAL_COMPACT: "FullCompact",
+    ROUTE_ROLE_SHORTCUT: "RoleBalanced",
+    ROUTE_HIERARCHICAL: "FullBalanced",
+    ROUTE_ROLE_TEMPORAL: "RoleTemporal",
+}
+
+
+class SubqueryRouteBandit:
+    """Small Thompson-style policy over a subquery-route action space.
+
+    The posterior is contextual only at a coarse, auditable level.  The online
+    evidence-gain update is used at deployment time; supervised retrieval
+    feedback is used only in the benchmark training phase.
+    """
+
+    def __init__(self, seed: int = 7) -> None:
+        self.rng = random.Random(seed)
+        self.alpha: Dict[str, Dict[str, float]] = {}
+        self.beta: Dict[str, Dict[str, float]] = {}
+
+    def bucket(self, task: Subquery, has_role_hint: bool) -> str:
+        return f"{task.intent}:{'role' if has_role_hint else 'global'}"
+
+    def _ensure(self, bucket: str) -> None:
+        if bucket in self.alpha:
+            return
+        self.alpha[bucket] = {
+            ROUTE_GLOBAL_COMPACT: 1.2,
+            ROUTE_HIERARCHICAL: 1.3,
+            ROUTE_ROLE_SHORTCUT: 1.2,
+            ROUTE_ROLE_TEMPORAL: 1.1,
+        }
+        self.beta[bucket] = {route: 1.0 for route in self.alpha[bucket]}
+
+    def posterior(self, task: Subquery, route: str, has_role_hint: bool, train: bool) -> float:
+        bucket = self.bucket(task, has_role_hint)
+        self._ensure(bucket)
+        alpha = self.alpha[bucket].get(route, 1.0)
+        beta = self.beta[bucket].get(route, 1.0)
+        return self.rng.betavariate(alpha, beta) if train else alpha / max(1e-9, alpha + beta)
+
+    def update(self, task: Subquery, route: str, has_role_hint: bool, reward_value: float) -> None:
+        bucket = self.bucket(task, has_role_hint)
+        self._ensure(bucket)
+        reward_value = max(0.0, min(1.0, reward_value))
+        self.alpha[bucket][route] = self.alpha[bucket].get(route, 1.0) + reward_value
+        self.beta[bucket][route] = self.beta[bucket].get(route, 1.0) + 1.0 - reward_value
+
+    def dump(self) -> Dict[str, Dict[str, float]]:
+        return {
+            bucket: {
+                route: round(alpha / max(1e-9, alpha + self.beta[bucket][route]), 4)
+                for route, alpha in routes.items()
+            }
+            for bucket, routes in sorted(self.alpha.items())
+        }
+
+
+def choose_subquery_route(
+    task: Subquery,
+    routes: Sequence[RouteCandidate],
+    *,
+    has_role_hint: bool,
+    completed_texts: Sequence[str],
+    policy: SubqueryRouteBandit,
+    train: bool,
+) -> Tuple[RouteCandidate, float, Dict[str, float]]:
+    """Score V(i, j) using evidence prior, dependency unlock, cost and redundancy."""
+    scored: List[Tuple[float, RouteCandidate, Dict[str, float]]] = []
+    for route in routes:
+        posterior = policy.posterior(task, route.route, has_role_hint, train=train)
+        dependency_gain = 0.16 * len(task.depends_on)
+        redundancy = max([lexical_overlap(task.text, text) for text in completed_texts] or [0.0])
+        value = (
+            0.43 * route.expected_evidence
+            + 0.27 * posterior
+            + dependency_gain
+            - 0.00013 * route.token_cost
+            - 0.00055 * route.search_cost
+            - 0.20 * redundancy
+        )
+        parts = {
+            "expected_evidence": round(route.expected_evidence, 6),
+            "policy_posterior": round(posterior, 6),
+            "dependency_gain": round(dependency_gain, 6),
+            "redundancy": round(redundancy, 6),
+            "value": round(value, 6),
+        }
+        scored.append((value, route, parts))
+    _value, selected, parts = max(scored, key=lambda item: (item[0], -item[1].token_cost, item[1].route))
+    return selected, parts["value"], parts
+
+
+def merge_subquery_evidence(
+    example: Any,
+    step_results: Sequence[Tuple[Subquery, RouteCandidate, ProfileRetrievalResult]],
+    qwen_reranker: QwenRerankerClient | None,
+    started: float,
+) -> ProfileRetrievalResult:
+    """Deduplicate route outputs and rerank source facts once against the full query."""
+    candidates: Dict[str, Tuple[ProfileFact, float, int]] = {}
+    for _task, _route, ret in step_results:
+        for rank, fact in enumerate(ret.selected_facts, start=1):
+            fact_id = fact.fact_id
+            previous = candidates.get(fact_id)
+            route_score = 1.0 / rank
+            if previous is None:
+                candidates[fact_id] = (fact, route_score, 1)
+            else:
+                candidates[fact_id] = (previous[0], previous[1] + route_score, previous[2] + 1)
+    facts = [item[0] for item in candidates.values()]
+    if qwen_reranker and facts:
+        rerank_scores = qwen_reranker.rerank(example.question, [fact.content for fact in facts])
+    else:
+        rerank_scores = [candidates[fact.fact_id][1] for fact in facts]
+    ranked: List[Tuple[ProfileFact, float]] = []
+    for fact, rerank_score in zip(facts, rerank_scores):
+        _saved, route_score, support_count = candidates[fact.fact_id]
+        score = float(rerank_score) + 0.08 * route_score + 0.05 * (support_count - 1)
+        ranked.append((fact, score))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    selected = pack_ranked(ranked, top_k=18, max_tokens=1100)
+    mean_score = sum(score for _fact, score in ranked[: max(1, len(selected))]) / max(1, len(selected))
+    return base.result(example.question, "HARMONY-Mem", selected, [], mean_score, started, len(facts))
+
+
+def run_harmony_subquery(
+    example: Any,
+    policy: SubqueryRouteBandit,
+    qwen_embed: QwenEmbeddingClient,
+    qwen_reranker: QwenRerankerClient | None,
+    *,
+    train: bool = False,
+    max_steps: int = 3,
+    token_budget: int = 1250,
+    search_budget: int = 280,
+) -> ProfileRetrievalResult:
+    """Execute bounded sequential (subquery, route) scheduling for HARMONY."""
+    started = time.time()
+    plan: QueryPlan = decompose_query(example.question, max_subqueries=max_steps)
+    available_roles = sorted({str(row.get("role") or "").strip() for row in example.rows if str(row.get("role") or "").strip()})
+    memory = build_memory(example.rows)
+    query_roles = {role.lower() for role in infer_query_roles(example.question, example.rows)}
+    has_role_hint = bool(
+        query_roles
+        and any(query_roles & {str(role).lower() for role in fact.metadata.get("role_mentions", [])} for fact in memory.facts.values())
+    )
+    pending = {task.subquery_id: task for task in plan.subqueries}
+    completed: List[Subquery] = []
+    completed_texts: List[str] = []
+    attempted_routes: Dict[str, set[str]] = {}
+    seen_fact_ids: set[str] = set()
+    step_results: List[Tuple[Subquery, RouteCandidate, ProfileRetrievalResult]] = []
+    step_trace: List[Dict[str, Any]] = []
+    used_tokens = 0
+    used_search = 0
+    stopped_reason = "all_subqueries_resolved"
+
+    for step_idx in range(max_steps):
+        ready = [
+            task for task in pending.values()
+            if all(dep in {done.subquery_id for done in completed} for dep in task.depends_on)
+        ]
+        if not ready:
+            stopped_reason = "dependency_blocked"
+            break
+        options: List[Tuple[float, Subquery, RouteCandidate, Dict[str, float]]] = []
+        for task in ready:
+            for route in candidate_routes(task, has_role_hint=has_role_hint):
+                if route.route in attempted_routes.get(task.subquery_id, set()):
+                    continue
+                if used_tokens + route.token_cost > token_budget or used_search + route.search_cost > search_budget:
+                    continue
+                selected, value, parts = choose_subquery_route(
+                    task,
+                    [route],
+                    has_role_hint=has_role_hint,
+                    completed_texts=completed_texts,
+                    policy=policy,
+                    train=train,
+                )
+                options.append((value, task, selected, parts))
+        if not options:
+            stopped_reason = "budget_exhausted"
+            break
+        _value, task, route, value_parts = max(options, key=lambda item: (item[0], -item[2].token_cost, item[2].route))
+        action = {item.name: item for item in action_space()}[ROUTE_TO_ACTION[route.route]]
+        # Keep a broad, inexpensive candidate pool from each route.  Qwen
+        # reranking happens once after all paths are fused; truncating to a
+        # route's final context size before that stage loses complementary
+        # evidence on multi-hop questions.
+        provisional_method = replace(
+            action.method,
+            top_k_facts=max(36, action.method.top_k_facts * 3),
+            max_tokens=max(2400, action.method.max_tokens * 2),
+        )
+        provisional_action = replace(action, method=provisional_method)
+        sub_example = replace(example, question=task.text)
+        ret = run_action(
+            sub_example,
+            provisional_action,
+            f"HARMONY-Mem/{route.route}",
+            qwen_embed,
+            # Route outputs are provisional.  Reranking each route and then
+            # reranking their union doubles latency for atomic questions, so
+            # HARMONY performs its expensive Qwen rerank once after fusion.
+            None,
+            memory=memory,
+            format_sources=False,
+        )
+        new_ids = [fact.fact_id for fact in ret.selected_facts if fact.fact_id not in seen_fact_ids]
+        novelty = len(new_ids) / max(1, len(ret.selected_facts))
+        confidence = max(0.0, min(1.0, float(ret.score)))
+        marginal_gain = 0.72 * novelty + 0.28 * confidence
+        policy.update(task, route.route, has_role_hint, marginal_gain)
+        seen_fact_ids.update(new_ids)
+        used_tokens += route.token_cost
+        used_search += int(ret.debug_scores[0].get("candidate_facts", route.search_cost)) if ret.debug_scores else route.search_cost
+        step_results.append((task, route, ret))
+        step_trace.append(
+            {
+                "step": step_idx + 1,
+                "subquery_id": task.subquery_id,
+                "subquery": task.text,
+                "intent": task.intent,
+                "route": route.route,
+                "action": action.name,
+                "value": value_parts,
+                "new_fact_count": len(new_ids),
+                "returned_fact_count": len(ret.selected_facts),
+                "marginal_evidence_gain": round(marginal_gain, 6),
+                "estimated_incremental_tokens": route.token_cost,
+                "retrieved_tokens": ret.tokens,
+                "candidate_facts": int(ret.debug_scores[0].get("candidate_facts", 0)) if ret.debug_scores else 0,
+            }
+        )
+        attempted_routes.setdefault(task.subquery_id, set()).add(route.route)
+        retry_atomic = (
+            task.intent in {"atomic_causal", "atomic_temporal"}
+            and len(attempted_routes[task.subquery_id]) < 2
+            and step_idx + 1 < max_steps
+        )
+        if not retry_atomic:
+            completed.append(task)
+            completed_texts.append(task.text)
+            pending.pop(task.subquery_id, None)
+        if step_idx > 0 and marginal_gain < 0.10 and len(seen_fact_ids) >= 6:
+            stopped_reason = "low_marginal_gain"
+            break
+
+    merged = merge_subquery_evidence(example, step_results, qwen_reranker, started)
+    merged = source_snippet_result(merged, example.question, "HARMONY-Mem", 88, 1100)
+    merged.channel = "HARMONY-Mem"
+    if merged.debug_scores:
+        merged.debug_scores[0].update(
+            {
+                "planner": {
+                    "decomposed": plan.decomposed,
+                    "confidence": round(plan.confidence, 6),
+                    "signals": plan.matched_signals,
+                    "relations": plan.relations,
+                    "subquery_count": len(plan.subqueries),
+                    "role_hints": [role for role in available_roles if role.lower() in example.question.lower()],
+                    "role_hyperedge_available": has_role_hint,
+                },
+                "scheduler_steps": step_trace,
+                "stopped_reason": stopped_reason,
+                "scheduler_tokens": used_tokens,
+                "scheduler_search_cost": used_search,
+            }
+        )
+    return merged
 
 
 def run_method_config(
@@ -599,12 +966,15 @@ def build_method_runs(
     ex: Any,
     wanted: set[str],
     harmony_action: RetrievalAction | None,
+    harmony_policy: SubqueryRouteBandit | None,
     qwen_embed: QwenEmbeddingClient,
     qwen_reranker: QwenRerankerClient | None,
 ) -> List[Tuple[str, ProfileRetrievalResult]]:
     method_runs: List[Tuple[str, ProfileRetrievalResult]] = []
-    if "HARMONY-Mem" in wanted and harmony_action is not None:
-        method_runs.append(("HARMONY-Mem", run_action(ex, harmony_action, "HARMONY-Mem", qwen_embed, qwen_reranker)))
+    if "HARMONY-Mem" in wanted and harmony_policy is not None:
+        method_runs.append(("HARMONY-Mem", run_harmony_subquery(ex, harmony_policy, qwen_embed, qwen_reranker)))
+    if "HARMONY-LegacyRouter" in wanted and harmony_action is not None:
+        method_runs.append(("HARMONY-LegacyRouter", run_action(ex, harmony_action, "HARMONY-LegacyRouter", qwen_embed, qwen_reranker)))
     if "HARMONY-NoRL-RoleBalanced" in wanted:
         method_runs.append(("HARMONY-NoRL-RoleBalanced", run_action(ex, fixed_role_balanced_action(), "HARMONY-NoRL-RoleBalanced", qwen_embed, qwen_reranker)))
     if "HARMONY-NoRole" in wanted:
@@ -644,11 +1014,40 @@ def run_test_example_worker(payload: Dict[str, Any]) -> Tuple[int, List[Dict[str
     rows: List[Dict[str, Any]] = []
     traces: List[Dict[str, Any]] = []
     train_seconds = float(payload.get("train_seconds") or 0.0)
-    method_runs = build_method_runs(ex, wanted, harmony_action, qwen_embed, qwen_reranker)
+    method_runs = build_method_runs(ex, wanted, harmony_action, SubqueryRouteBandit(seed=int(payload.get("seed", 7))), qwen_embed, qwen_reranker)
     for method_name, ret in method_runs:
         row = add_row(rows, method_name, ex, ret, train_seconds if method_name == "HARMONY-Mem" else 0.0)
-        traces.append({**row, "evidence": [f.content for f in ret.selected_facts]})
+        traces.append(
+            {
+                **row,
+                "evidence": [f.content for f in ret.selected_facts],
+                "planner": ret.debug_scores[0].get("planner", {}) if ret.debug_scores else {},
+                "scheduler": ret.debug_scores[0].get("scheduler_steps", []) if ret.debug_scores else [],
+            }
+        )
     return qi, rows, traces
+
+
+def update_subquery_policy_from_result(
+    example: Any,
+    ret: ProfileRetrievalResult,
+    policy: SubqueryRouteBandit,
+    supervised_reward: float,
+) -> None:
+    if not ret.debug_scores:
+        return
+    steps = ret.debug_scores[0].get("scheduler_steps", [])
+    if not isinstance(steps, list):
+        return
+    plan = decompose_query(example.question)
+    task_by_id = {task.subquery_id: task for task in plan.subqueries}
+    has_role_hint = bool(infer_query_roles(example.question, example.rows))
+    for step in steps:
+        task = task_by_id.get(str(step.get("subquery_id") or ""))
+        route = str(step.get("route") or "")
+        if task and route:
+            marginal = float(step.get("marginal_evidence_gain") or 0.0)
+            policy.update(task, route, has_role_hint, 0.65 * supervised_reward + 0.35 * marginal)
 
 
 def main() -> None:
@@ -659,9 +1058,11 @@ def main() -> None:
     parser.add_argument("--train-size", type=int, default=60)
     parser.add_argument("--test-size", type=int, default=120)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--split-unit", choices=["conversation", "question"], default="conversation")
+    parser.add_argument("--question-pattern", default="", help="Optional case-insensitive regex used to select evaluation questions.")
     parser.add_argument(
         "--methods",
-        default="HARMONY-Mem,HyperMem-Flow,Mem0-Lite,A-Mem-Lite,HippoRAG-Lite,LightRAG-Lite,BM25-turn,QwenEmb-turn",
+        default="HARMONY-Mem,HARMONY-LegacyRouter,HyperMem-Flow,Mem0-Lite,A-Mem-Lite,HippoRAG-Lite,LightRAG-Lite,BM25-turn,QwenEmb-turn",
     )
     parser.add_argument("--qwen-embedding-url", default="http://localhost:11810/v1/embeddings")
     parser.add_argument("--qwen-reranker-url", default="http://localhost:12810")
@@ -677,10 +1078,14 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     wanted = {m.strip() for m in args.methods.split(",") if m.strip()}
-    examples = load_examples(Path(args.data), max_examples=args.max_examples)
+    examples = load_examples(Path(args.data), max_examples=0)
+    if args.question_pattern:
+        question_pattern = re.compile(args.question_pattern, flags=re.I)
+        examples = [example for example in examples if question_pattern.search(example.question)]
+    examples = conversation_balanced_sample(examples, args.max_examples, args.seed)
     if args.skip_empty_gold:
         examples = [ex for ex in examples if str(ex.answer).strip()]
-    train, test = split_examples(examples, args.train_size, args.test_size, args.seed)
+    train, test = split_examples(examples, args.train_size, args.test_size, args.seed, split_unit=args.split_unit)
     (out_dir / "split_info.json").write_text(
         json.dumps(
             {
@@ -688,6 +1093,9 @@ def main() -> None:
                 "train_size": len(train),
                 "test_size": len(test),
                 "seed": args.seed,
+                "split_unit": args.split_unit,
+                "question_pattern": args.question_pattern,
+                "conversation_keys": sorted({conversation_key(ex) for ex in examples}),
                 "train_qtypes": qtype_counts(train),
                 "test_qtypes": qtype_counts(test),
                 "train_qids": [ex.qid for ex in train],
@@ -704,14 +1112,22 @@ def main() -> None:
 
     actions = action_space()
     router = ActionBandit(actions, seed=args.seed)
+    subquery_policy = SubqueryRouteBandit(seed=args.seed)
     train_started = time.time()
     if "HARMONY-Mem" in wanted:
         for ex in train:
+            ret = run_harmony_subquery(ex, subquery_policy, qwen_embed, qwen_reranker, train=True)
+            update_subquery_policy_from_result(ex, ret, subquery_policy, reward(ex, retrieval_metrics(ex, ret), ret))
+    if "HARMONY-LegacyRouter" in wanted:
+        for ex in train:
             action_idx = router.select(ex, train=True)
-            ret = run_action(ex, actions[action_idx], "HARMONY-Mem/train", qwen_embed, qwen_reranker)
+            ret = run_action(ex, actions[action_idx], "HARMONY-LegacyRouter/train", qwen_embed, qwen_reranker)
             router.update(ex, action_idx, reward(ex, retrieval_metrics(ex, ret), ret))
     train_seconds = time.time() - train_started
-    (out_dir / "router_state.json").write_text(json.dumps(router.dump(), ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "router_state.json").write_text(
+        json.dumps({"legacy_router": router.dump(), "subquery_policy": subquery_policy.dump()}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     cache_path = out_dir / "llm_cache.json"
     cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
@@ -721,13 +1137,13 @@ def main() -> None:
     harmony_plan = {
         ex.qid: actions[router.select(ex, train=False)].name
         for ex in test
-        if "HARMONY-Mem" in wanted
+        if "HARMONY-LegacyRouter" in wanted
     }
 
     rows: List[Dict[str, Any]] = []
     trace_path = out_dir / "trace.jsonl"
     with trace_path.open("w", encoding="utf-8") as trace:
-        can_parallel = args.num_workers > 1 and args.max_llm_judge <= 0
+        can_parallel = args.num_workers > 1 and args.max_llm_judge <= 0 and "HARMONY-Mem" not in wanted
         if can_parallel:
             payloads = [
                 {
@@ -739,6 +1155,7 @@ def main() -> None:
                     "qwen_reranker_url": args.qwen_reranker_url,
                     "use_qwen_reranker": bool(args.use_qwen_reranker),
                     "train_seconds": train_seconds,
+                    "seed": args.seed,
                 }
                 for qi, ex in enumerate(test, start=1)
             ]
@@ -758,7 +1175,7 @@ def main() -> None:
         else:
             for qi, ex in enumerate(test, start=1):
                 action = {a.name: a for a in actions}.get(harmony_plan.get(ex.qid, ""))
-                method_runs = build_method_runs(ex, wanted, action, qwen_embed, qwen_reranker)
+                method_runs = build_method_runs(ex, wanted, action, subquery_policy, qwen_embed, qwen_reranker)
                 for method_name, ret in method_runs:
                     row = add_row(rows, method_name, ex, ret, train_seconds if method_name == "HARMONY-Mem" else 0.0)
                     if reader is not None and judge is not None and qi <= args.max_llm_judge:
@@ -766,7 +1183,18 @@ def main() -> None:
                         judged = generate_and_judge(reader, judge, ex, ret, cache, key, args.reader_mode)
                         row.update({k: v for k, v in judged.items() if k != "judge_raw"})
                         cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-                    trace.write(json.dumps({**row, "evidence": [f.content for f in ret.selected_facts]}, ensure_ascii=False) + "\n")
+                    trace.write(
+                        json.dumps(
+                            {
+                                **row,
+                                "evidence": [f.content for f in ret.selected_facts],
+                                "planner": ret.debug_scores[0].get("planner", {}) if ret.debug_scores else {},
+                                "scheduler": ret.debug_scores[0].get("scheduler_steps", []) if ret.debug_scores else [],
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
                 print(f"[done] {qi}/{len(test)}", flush=True)
 
     write_csv(out_dir / "locomo_results.csv", rows)

@@ -372,8 +372,17 @@ def flatten_rows(item: Dict[str, Any]) -> List[Dict[str, Any]]:
 def build_memory(rows: Sequence[Dict[str, Any]]) -> ProfileCentricHypergraphMemory:
     memory = ProfileCentricHypergraphMemory(user_id="longmemeval", attach_threshold=0.58, discovery_threshold=0.62)
     session_fact_ids: Dict[str, List[str]] = {}
-    role_fact_ids: Dict[str, List[str]] = {}
+    speaker_fact_ids: Dict[str, List[str]] = {}
+    mention_fact_ids: Dict[str, List[str]] = {}
+    known_roles = sorted({str(row.get("role") or "").strip() for row in rows if str(row.get("role") or "").strip()})
     for idx, row in enumerate(rows, start=1):
+        row = dict(row)
+        raw_text = str(row.get("raw_content") or row.get("content") or "")
+        role_mentions = [
+            role for role in known_roles
+            if re.search(rf"\b{re.escape(role)}\b", raw_text, flags=re.I)
+        ]
+        row["role_mentions"] = role_mentions
         fid = str(row["row_id"])
         fact = memory.add_fact(
             content=str(row["content"]),
@@ -384,7 +393,9 @@ def build_memory(rows: Sequence[Dict[str, Any]]) -> ProfileCentricHypergraphMemo
             promote=False,
         )
         session_fact_ids.setdefault(str(row["session_id"]), []).append(fact.fact_id)
-        role_fact_ids.setdefault(str(row["role"]), []).append(fact.fact_id)
+        speaker_fact_ids.setdefault(str(row["role"]), []).append(fact.fact_id)
+        for role in role_mentions:
+            mention_fact_ids.setdefault(role, []).append(fact.fact_id)
     for sid, fids in session_fact_ids.items():
         facts = [memory.facts[fid] for fid in fids]
         date = str(facts[0].metadata.get("date") or "") if facts else ""
@@ -398,13 +409,21 @@ def build_memory(rows: Sequence[Dict[str, Any]]) -> ProfileCentricHypergraphMemo
             confidence=0.62,
             metadata={"edge_kind": "session", "session_id": sid, "date": date},
         )
-    for role, fids in role_fact_ids.items():
+    for role, fids in speaker_fact_ids.items():
         memory.create_edge(
             ProfileEdgeType.AUTO_DISCOVERED,
             fids,
-            summary=f"LongMemEval {role} turns",
+            summary=f"LongMemEval speaker index for {role}",
             confidence=0.45,
-            metadata={"edge_kind": "role", "role": role},
+            metadata={"edge_kind": "speaker_index", "role": role},
+        )
+    for role, fids in mention_fact_ids.items():
+        memory.create_edge(
+            ProfileEdgeType.AUTO_DISCOVERED,
+            fids,
+            summary=f"LongMemEval role hyperedge for mentions of {role}",
+            confidence=0.68,
+            metadata={"edge_kind": "role_hyperedge", "role": role},
         )
     return memory
 
@@ -488,9 +507,23 @@ def bm25_rank_docs(query: str, docs: Sequence[Tuple[str, str]], top_n: int) -> L
     return ranked[:top_n]
 
 
-def dense_rank_docs(query: str, docs: Sequence[Tuple[str, str]], qwen_embed: QwenEmbeddingClient, top_n: int) -> Tuple[List[Tuple[str, float]], Dict[str, List[float]], List[float]]:
-    vectors = qwen_embed.embed([query] + [text for _doc_id, text in docs])
-    qvec, dvecs = vectors[0], vectors[1:]
+def dense_rank_docs(
+    query: str,
+    docs: Sequence[Tuple[str, str]],
+    qwen_embed: QwenEmbeddingClient,
+    top_n: int,
+    embedding_cache: Dict[str, List[float]] | None = None,
+) -> Tuple[List[Tuple[str, float]], Dict[str, List[float]], List[float]]:
+    texts = [query] + [text for _doc_id, text in docs]
+    if embedding_cache is None:
+        vectors = qwen_embed.embed(texts)
+        qvec, dvecs = vectors[0], vectors[1:]
+    else:
+        missing = list(dict.fromkeys(text for text in texts if text not in embedding_cache))
+        if missing:
+            embedding_cache.update({text: vec for text, vec in zip(missing, qwen_embed.embed(missing))})
+        qvec = embedding_cache[query]
+        dvecs = [embedding_cache[text] for _doc_id, text in docs]
     emb = {doc_id: vec for (doc_id, _), vec in zip(docs, dvecs)}
     ranked = [(doc_id, qwen_embed.cosine(qvec, emb[doc_id])) for doc_id, _ in docs]
     ranked.sort(key=lambda x: x[1], reverse=True)
@@ -503,10 +536,37 @@ def retrieve_hypermem_full(
     method: MethodConfig,
     qwen_embed: QwenEmbeddingClient,
     qwen_reranker: QwenRerankerClient | None,
+    role_hints: Sequence[str] = (),
 ) -> ProfileRetrievalResult:
     started = time.time()
     facts = list(memory.facts.values())
+    embedding_cache = getattr(memory, "_qwen_embedding_cache", None)
+    if embedding_cache is None:
+        embedding_cache = {}
+        setattr(memory, "_qwen_embedding_cache", embedding_cache)
     episodes, topics = build_episode_topic_docs(facts)
+    normalized_roles = {str(role).strip().lower() for role in role_hints if str(role).strip()}
+    speaker_role_facts = [
+        fact for fact in facts
+        if str(fact.metadata.get("role") or "").strip().lower() in normalized_roles
+    ]
+    speaker_role_fact_ids = {fact.fact_id for fact in speaker_role_facts}
+    mentioned_role_anchor_facts = [
+        fact for fact in facts
+        if normalized_roles & {str(role).strip().lower() for role in fact.metadata.get("role_mentions", [])}
+    ]
+    role_anchor_mode = "mention_hyperedge"
+    role_anchor_facts = mentioned_role_anchor_facts
+    if not role_anchor_facts:
+        # Speaker identity is only a fallback.  The answer to a question about
+        # a person is often said by their conversation partner.
+        role_anchor_mode = "speaker_fallback"
+        role_anchor_facts = speaker_role_facts
+    role_anchor_sessions = {
+        str(fact.metadata.get("session_id") or "")
+        for fact in role_anchor_facts
+        if str(fact.metadata.get("session_id") or "")
+    }
 
     topic_docs = [(tid, t["text"]) for tid, t in topics.items()]
     episode_docs = [(eid, e["text"]) for eid, e in episodes.items()]
@@ -514,7 +574,7 @@ def retrieve_hypermem_full(
 
     candidate_n = max(method.initial_candidates, method.topic_top_k, method.episode_top_k, method.top_k_facts)
     topic_bm25 = bm25_rank_docs(example.question, topic_docs, min(candidate_n, len(topic_docs))) if topic_docs else []
-    topic_dense, topic_emb, qvec = dense_rank_docs(example.question, topic_docs, qwen_embed, min(candidate_n, len(topic_docs))) if topic_docs else ([], {}, qwen_embed.embed([example.question])[0])
+    topic_dense, topic_emb, qvec = dense_rank_docs(example.question, topic_docs, qwen_embed, min(candidate_n, len(topic_docs)), embedding_cache=embedding_cache) if topic_docs else ([], {}, qwen_embed.embed([example.question])[0])
     topic_fused = rrf_fuse([topic_bm25, topic_dense])
     top_topics = [tid for tid, _ in sorted(topic_fused.items(), key=lambda x: x[1], reverse=True)[: method.topic_top_k]]
     allowed_episode_ids = {
@@ -522,10 +582,14 @@ def retrieve_hypermem_full(
         for tid in top_topics
         for eid in topics.get(tid, {}).get("episode_ids", [])
     } or set(episodes.keys())
+    # A role hyperedge is a shortcut, not a hard filter.  It contributes the
+    # sessions in which the named role appears, preserving partner turns that
+    # may contain the actual answer evidence.
+    allowed_episode_ids.update(role_anchor_sessions)
 
     episode_pool_docs = [(eid, episodes[eid]["text"]) for eid in allowed_episode_ids if eid in episodes]
     ep_bm25 = bm25_rank_docs(example.question, episode_pool_docs, min(candidate_n, len(episode_pool_docs))) if episode_pool_docs else []
-    ep_dense, ep_emb, _ = dense_rank_docs(example.question, episode_pool_docs, qwen_embed, min(candidate_n, len(episode_pool_docs))) if episode_pool_docs else ([], {}, qvec)
+    ep_dense, ep_emb, _ = dense_rank_docs(example.question, episode_pool_docs, qwen_embed, min(candidate_n, len(episode_pool_docs)), embedding_cache=embedding_cache) if episode_pool_docs else ([], {}, qvec)
     ep_fused = rrf_fuse([ep_bm25, ep_dense])
     top_episodes = [eid for eid, _ in sorted(ep_fused.items(), key=lambda x: x[1], reverse=True)[: method.episode_top_k]]
     allowed_fact_ids = {
@@ -537,7 +601,7 @@ def retrieve_hypermem_full(
     fact_pool = [f for f in facts if f.fact_id in allowed_fact_ids]
     fact_pool_docs = [(f.fact_id, f.content) for f in fact_pool]
     fact_bm25 = bm25_rank_docs(example.question, fact_pool_docs, min(candidate_n, len(fact_pool_docs))) if fact_pool_docs else []
-    fact_dense, fact_emb_raw, _ = dense_rank_docs(example.question, fact_pool_docs, qwen_embed, min(candidate_n, len(fact_pool_docs))) if fact_pool_docs else ([], {}, qvec)
+    fact_dense, fact_emb_raw, _ = dense_rank_docs(example.question, fact_pool_docs, qwen_embed, min(candidate_n, len(fact_pool_docs)), embedding_cache=embedding_cache) if fact_pool_docs else ([], {}, qvec)
 
     # Hypergraph embedding propagation: turn/fact vectors absorb episode and topic context.
     episode_vecs: Dict[str, List[float]] = {}
@@ -573,7 +637,21 @@ def retrieve_hypermem_full(
 
     fused = rrf_fuse([fact_bm25, fact_dense, fact_dense_prop])
     candidate_ids = [fid for fid, _ in sorted(fused.items(), key=lambda x: x[1], reverse=True)[: method.initial_candidates]]
-    by_id = {f.fact_id: f for f in fact_pool}
+    by_id = {f.fact_id: f for f in facts}
+    role_candidates = [
+        fact for fact in facts
+        if str(fact.metadata.get("session_id") or "") in role_anchor_sessions or fact.fact_id in speaker_role_fact_ids
+    ]
+    role_candidates.sort(
+        key=lambda fact: (
+            str(fact.metadata.get("role") or "").strip().lower() in normalized_roles,
+            keyword_overlap(example.question, fact.content),
+        ),
+        reverse=True,
+    )
+    for fact in role_candidates[: max(4, method.initial_candidates // 3)]:
+        if fact.fact_id not in candidate_ids:
+            candidate_ids.append(fact.fact_id)
     candidates = [by_id[fid] for fid in candidate_ids if fid in by_id]
     if qwen_reranker is not None and candidates:
         rerank_scores = qwen_reranker.rerank(example.question, [f.content for f in candidates])
@@ -582,14 +660,32 @@ def retrieve_hypermem_full(
     ranked: List[Tuple[ProfileFact, float]] = []
     for fact, rr in zip(candidates, rerank_scores):
         role = str(fact.metadata.get("role") or "")
-        role_prior = 0.04 if role == "user" else -0.02 if role == "assistant" else 0.0
+        role_key = role.strip().lower()
+        session_id = str(fact.metadata.get("session_id") or "")
+        mentioned_roles = {str(item).strip().lower() for item in fact.metadata.get("role_mentions", [])}
+        if normalized_roles & mentioned_roles:
+            role_prior = 0.16
+        elif session_id in role_anchor_sessions:
+            role_prior = 0.06
+        else:
+            role_prior = 0.04 if role == "user" else -0.02 if role == "assistant" else 0.0
         temporal_prior = 0.03 if re.search(r"\b(when|date|days?|weeks?|months?|before|after|first|last)\b", example.question.lower()) else 0.0
         score = float(rr) + role_prior + temporal_prior + 0.05 * keyword_overlap(example.question, fact.content)
         ranked.append((fact, score))
     ranked.sort(key=lambda x: x[1], reverse=True)
     selected = pack_ranked(ranked, method.top_k_facts, method.max_tokens)
     avg = sum(s for _, s in ranked[: max(1, method.top_k_facts)]) / max(1, min(len(ranked), method.top_k_facts))
-    return result(example.question, method.name, selected, [], avg, started, len(candidates))
+    ret = result(example.question, method.name, selected, [], avg, started, len(candidates))
+    if ret.debug_scores:
+        ret.debug_scores[0].update(
+            {
+                "role_hints": sorted(normalized_roles),
+                "role_anchor_mode": role_anchor_mode,
+                "role_anchor_sessions": len(role_anchor_sessions),
+                "role_shortcut_candidates": len(role_candidates),
+            }
+        )
+    return ret
 
 
 def retrieve_method(
@@ -598,6 +694,7 @@ def retrieve_method(
     method: MethodConfig,
     qwen_embed: QwenEmbeddingClient | None = None,
     qwen_reranker: QwenRerankerClient | None = None,
+    role_hints: Sequence[str] = (),
 ) -> ProfileRetrievalResult:
     started = time.time()
     qemb = memory.embedding_model.encode(example.question)
@@ -612,7 +709,7 @@ def retrieve_method(
     if method.graph_gate == "hypermem_full":
         if qwen_embed is None:
             raise RuntimeError(f"{method.name} requires Qwen embedding service")
-        return retrieve_hypermem_full(example, memory, method, qwen_embed, qwen_reranker)
+        return retrieve_hypermem_full(example, memory, method, qwen_embed, qwen_reranker, role_hints=role_hints)
     if method.graph_gate in {"qwen_dense", "qwen_hg"}:
         if qwen_embed is None:
             raise RuntimeError(f"{method.name} requires Qwen embedding service")
