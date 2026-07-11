@@ -99,3 +99,27 @@ def test_conversation_sampling_and_split_do_not_leak_dialogues():
     assert {compare.conversation_key(example) for example in train}.isdisjoint(
         {compare.conversation_key(example) for example in test}
     )
+
+
+def test_atomic_questions_use_the_single_path_gate_when_available():
+    rows = [
+        {
+            "row_id": "r1", "session_id": "s1", "session_index": 0, "turn_index": 0,
+            "date": "2024-01-01", "role": "Alice", "has_answer": True,
+            "content": "[2024-01-01] Alice: My pet is named Momo.", "raw_content": "My pet is named Momo.",
+        }
+    ]
+    example = LongMemExample(
+        qid="atomic", qtype="locomo_category_1", question="What is my pet's name?", answer="Momo",
+        question_date="2024-01-01", rows=rows, answer_session_ids=["s1"],
+    )
+    action = next(item for item in compare.action_space() if item.name == "FullCompact")
+    result = compare.run_harmony_subquery(
+        example,
+        compare.SubqueryRouteBandit(seed=7),
+        FakeEmbedding(),
+        FakeReranker(),
+        atomic_action=action,
+    )
+    assert result.debug_scores[0]["planner"]["atomic_gate"] == "legacy_single_path"
+    assert result.debug_scores[0]["scheduler_steps"][0]["action"] == "FullCompact"

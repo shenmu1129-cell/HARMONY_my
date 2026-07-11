@@ -529,6 +529,7 @@ def run_harmony_subquery(
     qwen_embed: QwenEmbeddingClient,
     qwen_reranker: QwenRerankerClient | None,
     *,
+    atomic_action: RetrievalAction | None = None,
     train: bool = False,
     max_steps: int = 3,
     token_budget: int = 1250,
@@ -537,6 +538,46 @@ def run_harmony_subquery(
     """Execute bounded sequential (subquery, route) scheduling for HARMONY."""
     started = time.time()
     plan: QueryPlan = decompose_query(example.question, max_subqueries=max_steps)
+    # Most long-memory questions are atomic.  Reusing the trained, cheap
+    # single-path controller here is the intended gate behavior; the
+    # subquery scheduler is reserved for genuine dependency-bearing queries.
+    if not plan.decomposed and atomic_action is not None:
+        ret = run_action(
+            example,
+            atomic_action,
+            "HARMONY-Mem",
+            qwen_embed,
+            qwen_reranker,
+        )
+        if ret.debug_scores:
+            ret.debug_scores[0].update(
+                {
+                    "planner": {
+                        "decomposed": False,
+                        "confidence": round(plan.confidence, 6),
+                        "signals": plan.matched_signals,
+                        "relations": [],
+                        "subquery_count": 1,
+                        "atomic_gate": "legacy_single_path",
+                    },
+                    "scheduler_steps": [
+                        {
+                            "step": 1,
+                            "subquery_id": plan.subqueries[0].subquery_id,
+                            "subquery": plan.subqueries[0].text,
+                            "intent": plan.subqueries[0].intent,
+                            "route": "legacy_single_path",
+                            "action": atomic_action.name,
+                            "new_fact_count": len(ret.selected_facts),
+                            "returned_fact_count": len(ret.selected_facts),
+                            "marginal_evidence_gain": 1.0,
+                            "retrieved_tokens": ret.tokens,
+                        }
+                    ],
+                    "stopped_reason": "atomic_single_path",
+                }
+            )
+        return ret
     available_roles = sorted({str(row.get("role") or "").strip() for row in example.rows if str(row.get("role") or "").strip()})
     memory = build_memory(example.rows)
     query_roles = {role.lower() for role in infer_query_roles(example.question, example.rows)}
@@ -972,7 +1013,7 @@ def build_method_runs(
 ) -> List[Tuple[str, ProfileRetrievalResult]]:
     method_runs: List[Tuple[str, ProfileRetrievalResult]] = []
     if "HARMONY-Mem" in wanted and harmony_policy is not None:
-        method_runs.append(("HARMONY-Mem", run_harmony_subquery(ex, harmony_policy, qwen_embed, qwen_reranker)))
+        method_runs.append(("HARMONY-Mem", run_harmony_subquery(ex, harmony_policy, qwen_embed, qwen_reranker, atomic_action=harmony_action)))
     if "HARMONY-LegacyRouter" in wanted and harmony_action is not None:
         method_runs.append(("HARMONY-LegacyRouter", run_action(ex, harmony_action, "HARMONY-LegacyRouter", qwen_embed, qwen_reranker)))
     if "HARMONY-NoRL-RoleBalanced" in wanted:
@@ -995,6 +1036,14 @@ def build_method_runs(
         method_runs.append(("HippoRAG-Lite", retrieve_hipporag_lite(ex, qwen_embed, qwen_reranker)))
     if "LightRAG-Lite" in wanted:
         method_runs.append(("LightRAG-Lite", retrieve_lightrag_lite(ex, qwen_embed, qwen_reranker)))
+    # Qwen services exhibit a per-question warm-up/queue effect.  A fixed
+    # method order would systematically charge that cost to HARMONY, which is
+    # first in the paper table.  Rotate deterministically by qid so every
+    # method occupies each position across the split.
+    if len(method_runs) > 1:
+        match = re.search(r"::qa_(\d+)$", str(ex.qid))
+        offset = int(match.group(1)) % len(method_runs) if match else sum(ord(char) for char in str(ex.qid)) % len(method_runs)
+        method_runs = method_runs[offset:] + method_runs[:offset]
     return method_runs
 
 
@@ -1114,15 +1163,16 @@ def main() -> None:
     router = ActionBandit(actions, seed=args.seed)
     subquery_policy = SubqueryRouteBandit(seed=args.seed)
     train_started = time.time()
-    if "HARMONY-Mem" in wanted:
-        for ex in train:
-            ret = run_harmony_subquery(ex, subquery_policy, qwen_embed, qwen_reranker, train=True)
-            update_subquery_policy_from_result(ex, ret, subquery_policy, reward(ex, retrieval_metrics(ex, ret), ret))
-    if "HARMONY-LegacyRouter" in wanted:
+    if "HARMONY-Mem" in wanted or "HARMONY-LegacyRouter" in wanted:
         for ex in train:
             action_idx = router.select(ex, train=True)
-            ret = run_action(ex, actions[action_idx], "HARMONY-LegacyRouter/train", qwen_embed, qwen_reranker)
+            ret = run_action(ex, actions[action_idx], "HARMONY-AtomicRouter/train", qwen_embed, qwen_reranker)
             router.update(ex, action_idx, reward(ex, retrieval_metrics(ex, ret), ret))
+    if "HARMONY-Mem" in wanted:
+        for ex in train:
+            atomic_action = actions[router.select(ex, train=False)]
+            ret = run_harmony_subquery(ex, subquery_policy, qwen_embed, qwen_reranker, atomic_action=atomic_action, train=True)
+            update_subquery_policy_from_result(ex, ret, subquery_policy, reward(ex, retrieval_metrics(ex, ret), ret))
     train_seconds = time.time() - train_started
     (out_dir / "router_state.json").write_text(
         json.dumps({"legacy_router": router.dump(), "subquery_policy": subquery_policy.dump()}, ensure_ascii=False, indent=2),
@@ -1137,7 +1187,7 @@ def main() -> None:
     harmony_plan = {
         ex.qid: actions[router.select(ex, train=False)].name
         for ex in test
-        if "HARMONY-LegacyRouter" in wanted
+        if "HARMONY-Mem" in wanted or "HARMONY-LegacyRouter" in wanted
     }
 
     rows: List[Dict[str, Any]] = []
