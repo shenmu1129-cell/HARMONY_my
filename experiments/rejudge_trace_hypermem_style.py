@@ -136,14 +136,15 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 def summarize(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = list(rows)
-    groups: Dict[str, List[Dict[str, Any]]] = {}
+    groups: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
     for row in rows:
-        groups.setdefault(str(row["variant"]), []).append(row)
+        groups.setdefault((str(row.get("method") or ""), str(row["variant"])), []).append(row)
     out = []
-    for variant, part in sorted(groups.items()):
+    for (method, variant), part in sorted(groups.items()):
         n = len(part)
         out.append(
             {
+                "method": method,
                 "variant": variant,
                 "n": n,
                 "llm_acc": round(sum(float(r["judge_score"]) for r in part) / n, 6) if n else "",
@@ -204,6 +205,7 @@ def main() -> None:
                 cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
             out.append(
                 {
+                    "method": row.get("method"),
                     "variant": variant,
                     "qid": row["qid"],
                     "qtype": row.get("qtype"),
