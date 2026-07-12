@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import csv
 import json
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -16,28 +17,17 @@ from openai import OpenAI, OpenAIError
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-HYPERMEM_ROOT = ROOT / "HyperMem"
-if str(HYPERMEM_ROOT) not in sys.path:
-    sys.path.insert(0, str(HYPERMEM_ROOT))
-
+from hypermem import load_runtime_env  # noqa: E402
 from hypermem.prompts.answer_prompts import ANSWER_PROMPT_NEMORI_COT  # noqa: E402
+
+THREAD_LOCAL = threading.local()
 
 
 def load_openai_key() -> str:
+    load_runtime_env()
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if key:
         return key
-
-    smoke = ROOT / "HyperMem" / "examples" / "openai_api_smoke_test.py"
-    if smoke.exists():
-        tree = ast.parse(smoke.read_text(encoding="utf-8"))
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == "OPENAI_API_KEY":
-                        value = ast.literal_eval(node.value)
-                        if isinstance(value, str) and value.strip():
-                            return value.strip()
     raise RuntimeError("OPENAI_API_KEY is missing")
 
 
@@ -66,6 +56,17 @@ class OpenAIChat:
                 print(f"[warn] {self.model} failed attempt {attempt + 1}/5: {exc}; retrying in {wait_s}s", flush=True)
                 time.sleep(wait_s)
         raise RuntimeError(f"{self.model} failed after retries: {last_exc}") from last_exc
+
+
+def thread_chat(model: str, base_url: str) -> OpenAIChat:
+    clients = getattr(THREAD_LOCAL, "clients", None)
+    if clients is None:
+        clients = {}
+        THREAD_LOCAL.clients = clients
+    key = (model, base_url)
+    if key not in clients:
+        clients[key] = OpenAIChat(model, base_url)
+    return clients[key]
 
 
 def parse_jsonish(text: str) -> Dict[str, Any]:
@@ -164,11 +165,63 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "variant": variant,
                 "n": n,
                 "llm_acc": round(sum(float(r["judge_score"]) for r in part) / n, 6) if n else "",
-                "avg_tokens": round(sum(float(r.get("retrieval_tokens", 0)) for r in part) / n, 1) if n else "",
-                "avg_ms": round(sum(float(r.get("retrieval_ms", 0)) for r in part) / n, 1) if n else "",
+                "retrieval_tokens": round(sum(float(r.get("retrieval_tokens", 0)) for r in part) / n, 1) if n else "",
+                "retrieval_latency_ms": round(sum(float(r.get("retrieval_ms", 0)) for r in part) / n, 1) if n else "",
             }
         )
     return out
+
+
+def scenario_label(row: Dict[str, Any]) -> str:
+    labels = {1: "single_hop", 2: "temporal", 3: "multi_hop", 4: "open_domain", 5: "adversarial"}
+    return labels.get(category(row), "unknown")
+
+
+def summarize_by_scenario(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: Dict[tuple[str, str, str], List[Dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault((str(row.get("method") or ""), str(row["variant"]), scenario_label(row)), []).append(row)
+    out: List[Dict[str, Any]] = []
+    for (method, variant, scenario), part in sorted(groups.items()):
+        n = len(part)
+        out.append(
+            {
+                "method": method,
+                "variant": variant,
+                "scenario": scenario,
+                "n": n,
+                "llm_acc": round(sum(float(row["judge_score"]) for row in part) / n, 6) if n else "",
+                "retrieval_tokens": round(sum(float(row.get("retrieval_tokens", 0)) for row in part) / n, 1) if n else "",
+                "retrieval_latency_ms": round(sum(float(row.get("retrieval_ms", 0)) for row in part) / n, 1) if n else "",
+            }
+        )
+    return out
+
+
+def cache_key(row: Dict[str, Any], variant: str, args: argparse.Namespace) -> str:
+    # qid is shared by all retrieval methods.  The cache must therefore
+    # identify the method and reader-context settings as well, otherwise one
+    # method's generated answer can be reused for another method.
+    return (
+        f"method={row.get('method', '')}::{row['qid']}::{variant}"
+        f"::reader={args.reader_model}::judge={args.judge_model}"
+        f"::evidence={args.max_evidence}::chars={args.max_context_chars}::hmstyle_v2"
+    )
+
+
+def evaluate_entry(entry: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    row = entry["row"]
+    variant = entry["variant"]
+    if variant == "rejudge_existing":
+        answer = str(row.get("answer") or "")
+    elif variant == "regenerate_4_1_mini":
+        reader = thread_chat(args.reader_model, args.base_url)
+        answer = generate_hypermem_answer(reader, row, args.max_evidence, args.max_context_chars)
+    else:
+        raise ValueError(f"unknown variant: {variant}")
+    judge = thread_chat(args.judge_model, args.base_url)
+    judged = judge_hypermem_style(judge, row, answer)
+    return {"answer": answer, **judged}
 
 
 def main() -> None:
@@ -183,6 +236,7 @@ def main() -> None:
     parser.add_argument("--max-evidence", type=int, default=18)
     parser.add_argument("--max-context-chars", type=int, default=9000)
     parser.add_argument("--variants", default="rejudge_existing,regenerate_4_1_mini")
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -197,48 +251,62 @@ def main() -> None:
         rows = rows[: args.max_items]
 
     variants = {v.strip() for v in args.variants.split(",") if v.strip()}
-    reader = OpenAIChat(args.reader_model, args.base_url) if "regenerate_4_1_mini" in variants else None
-    judge = OpenAIChat(args.judge_model, args.base_url)
-    out: List[Dict[str, Any]] = []
-
+    entries: List[Dict[str, Any]] = []
+    results: Dict[str, Dict[str, Any]] = {}
     for idx, row in enumerate(rows, start=1):
         for variant in sorted(variants):
-            key = f"{row['qid']}::{variant}::reader={args.reader_model}::judge={args.judge_model}::hmstyle_v1"
+            key = cache_key(row, variant, args)
+            entry = {"idx": idx, "row": row, "variant": variant, "key": key}
+            entries.append(entry)
             if key in cache:
-                result = dict(cache[key])
-            else:
-                if variant == "rejudge_existing":
-                    answer = str(row.get("answer") or "")
-                elif variant == "regenerate_4_1_mini":
-                    if reader is None:
-                        raise RuntimeError("reader was not initialized")
-                    answer = generate_hypermem_answer(reader, row, args.max_evidence, args.max_context_chars)
-                else:
-                    raise ValueError(f"unknown variant: {variant}")
-                judged = judge_hypermem_style(judge, row, answer)
-                result = {"answer": answer, **judged}
-                cache[key] = result
+                results[key] = dict(cache[key])
+
+    pending = [entry for entry in entries if entry["key"] not in results]
+    print(f"[judge] total={len(entries)} cached={len(results)} pending={len(pending)} workers={args.workers}", flush=True)
+    if pending:
+        if args.workers <= 1:
+            for done, entry in enumerate(pending, start=1):
+                result = evaluate_entry(entry, args)
+                results[entry["key"]] = result
+                cache[entry["key"]] = result
                 cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-            out.append(
-                {
-                    "method": row.get("method"),
-                    "variant": variant,
-                    "qid": row["qid"],
-                    "qtype": row.get("qtype"),
-                    "question": row.get("question"),
-                    "gold": row.get("gold"),
-                    "retrieval_tokens": row.get("retrieval_tokens"),
-                    "retrieval_ms": row.get("retrieval_ms"),
-                    **result,
-                }
-            )
-        print(f"[done] {idx}/{len(rows)} {row['qid']}", flush=True)
+                print(f"[judge] {done}/{len(pending)} {entry['row']['qid']} {entry['variant']}", flush=True)
+        else:
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                future_map = {pool.submit(evaluate_entry, entry, args): entry for entry in pending}
+                for done, future in enumerate(as_completed(future_map), start=1):
+                    entry = future_map[future]
+                    result = future.result()
+                    results[entry["key"]] = result
+                    cache[entry["key"]] = result
+                    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+                    print(f"[judge] {done}/{len(pending)} {entry['row']['qid']} {entry['variant']}", flush=True)
+
+    out: List[Dict[str, Any]] = []
+    for entry in entries:
+        row = entry["row"]
+        result = results[entry["key"]]
+        out.append(
+            {
+                "method": row.get("method"),
+                "variant": entry["variant"],
+                "qid": row["qid"],
+                "qtype": row.get("qtype"),
+                "question": row.get("question"),
+                "gold": row.get("gold"),
+                "retrieval_tokens": row.get("retrieval_tokens"),
+                "retrieval_ms": row.get("retrieval_ms"),
+                **result,
+            }
+        )
 
     jsonl_path = out_dir / "hypermem_style_results.jsonl"
     jsonl_path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in out) + "\n", encoding="utf-8")
     write_csv(out_dir / "hypermem_style_results.csv", out)
     summary = summarize(out)
     write_csv(out_dir / "hypermem_style_summary.csv", summary)
+    scenario_summary = summarize_by_scenario(out)
+    write_csv(out_dir / "hypermem_style_scenarios.csv", scenario_summary)
     print((out_dir / "hypermem_style_summary.csv").read_text(encoding="utf-8"), flush=True)
 
 

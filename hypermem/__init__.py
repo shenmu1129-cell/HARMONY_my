@@ -18,26 +18,33 @@ def _strip_env_quotes(value: str) -> str:
 def load_runtime_env(path: str | None = None, *, override: bool = False) -> None:
     """Load simple KEY=VALUE runtime config for local experiments.
 
-    The default path is the user's DeepSeek config. This runs when the hypermem
-    package is imported, so scripts do not need to manually source the file.
+    The project-local OpenAI config is preferred.  DeepSeek's legacy server
+    config remains a fallback for existing experiments.  This runs when the
+    package is imported, so scripts do not need to manually source either file.
     """
+    project_root = Path(__file__).resolve().parents[1]
     default_path = "/home/sutongtong/wwt/code/hyperMem_my/configs/deepseek.env"
-    env_path = Path(path or os.getenv("DEEPSEEK_ENV_FILE", default_path)).expanduser()
-    if not env_path.exists() or not env_path.is_file():
-        return
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+    explicit_path = path or os.getenv("OPENAI_ENV_FILE") or os.getenv("DEEPSEEK_ENV_FILE")
+    env_paths = [Path(explicit_path).expanduser()] if explicit_path else [
+        project_root / "configs" / "openai.env",
+        Path(default_path),
+    ]
+    for env_path in env_paths:
+        if not env_path.exists() or not env_path.is_file():
             continue
-        if line.startswith("export "):
-            line = line[len("export ") :].strip()
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = _strip_env_quotes(value)
-        if key and (override or key not in os.environ):
-            os.environ[key] = value
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = _strip_env_quotes(value)
+            if key and value and (override or key not in os.environ):
+                os.environ[key] = value
 
 
 load_runtime_env()

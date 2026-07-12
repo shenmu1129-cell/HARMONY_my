@@ -1,6 +1,6 @@
 # HARMONY-Mem
 
-HARMONY-Mem is the current long-term conversational-memory retrieval framework in this repository. It keeps HyperMem's hierarchical memory organisation, then adds source-preserving evidence, role-conditioned behavioural hyperedges, and a recall-safe contextual-bandit router that chooses the retrieval budget per query.
+HARMONY-Mem is the paper-facing long-term conversational-memory retrieval framework in this repository. It keeps HyperMem's hierarchical memory organisation, then adds source-preserving evidence, soft role-conditioned routing, and a recall-safe contextual-bandit router that chooses the retrieval budget per query.
 
 The research question is practical: retain strong answer accuracy while controlling the evidence-token budget and retrieval latency.
 
@@ -37,14 +37,7 @@ The current report intentionally keeps three primary metrics:
 - `retrieval_tokens`: tokens in the retrieved evidence sent to the answer model.
 - `retrieval_latency_ms`: retrieval latency only; it excludes answer-generation and judge latency.
 
-The latest HARMONY LoCoMo run used Qwen3 embedding and reranking, 60 training questions, 80 test questions, source-preserving evidence, and `gpt-4o-mini` for the original reader/judge run.
-
-| Setting | Questions | `llm_acc` | `retrieval_tokens` | `retrieval_latency_ms` |
-| --- | ---: | ---: | ---: | ---: |
-| Strict original evaluation | 80 | 0.7625 | 774.1 | 3463.2 |
-| HyperMem-aligned answer/judge protocol | 78, category 5 excluded | 0.9744 | 771.6 | 3454.5 |
-
-The second row regenerates answers from the same retrieved evidence with `gpt-4.1-mini` and HyperMem's CoT answer prompt, then uses the HyperMem-style `gpt-4o-mini` judge. It is a same-split, final-stage protocol alignment check, not a fresh full-benchmark reproduction or a directly comparable paper score.
+The paper protocol uses a conversation-disjoint, category-balanced partial LoCoMo split: 32 routing-training questions and 64 held-out evaluation questions, with 16 questions in each of the single-hop, temporal, multi-hop, and open-domain categories. It fixes Qwen3 embedding/reranking, a `gpt-4.1-mini` reader, and a `gpt-4o-mini` judge for every method in a table. See [the AAAI experiment protocol](docs/aaai_experiment_protocol.md) for the exact comparison, ablation, robustness, scenario, and protocol-sensitivity matrix.
 
 ## Setup
 
@@ -90,7 +83,7 @@ OPENAI_API_KEY="sk-..." conda run -n wwt310 python experiments/rejudge_trace_hyp
   --judge-model gpt-4o-mini
 ```
 
-`experiments/eval_locomo_comparison.py` contains the HARMONY router and lightweight LoCoMo-compatible comparison baselines. `experiments/rejudge_trace_hypermem_style.py` reruns only the final answer/judge stage over an existing trace, so retrieval and router results are unchanged.
+`experiments/eval_locomo_comparison.py` contains the paper-facing single-query HARMONY router and lightweight LoCoMo-compatible comparison baselines. `HARMONY-Subquery` remains available as an experimental method name, but is intentionally excluded from the paper's main results. `experiments/rejudge_trace_hypermem_style.py` reruns only the final answer/judge stage over an existing trace, so retrieval and router results are unchanged.
 
 ## Repository Layout
 
