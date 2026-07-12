@@ -35,13 +35,11 @@ console = Console()
 logging.basicConfig(level=logging.CRITICAL)
 transformers.logging.set_verbosity_error()
 
-# Download necessary NLTK resources
-try:
-    nltk.download("wordnet", quiet=True)
-    nltk.download("punkt", quiet=True)
-    print("NLTK resources downloaded successfully.")
-except Exception as e:
-    print(f"Warning: Failed to download NLTK resources: {e}")
+def safe_word_tokenize(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z]+", str(text).lower())
+
+
+print("NLTK download skipped; using regex tokenization fallback when needed.")
 
 try:
     sentence_model_name = "Qwen/Qwen3-Embedding-0.6B"
@@ -229,11 +227,11 @@ def calculate_nlp_metrics(gold_answer, response, context, options=None):
     gold_answer = str(gold_answer) if gold_answer is not None else ""
     response = str(response) if response is not None else ""
 
-    metrics = {"context_tokens": len(nltk.word_tokenize(context)) if context else 0}
+    metrics = {"context_tokens": len(safe_word_tokenize(context)) if context else 0}
 
     if "lexical" in options:
-        gold_tokens = nltk.word_tokenize(gold_answer.lower())
-        response_tokens = nltk.word_tokenize(response.lower())
+        gold_tokens = safe_word_tokenize(gold_answer)
+        response_tokens = safe_word_tokenize(response)
 
         metrics["lexical"] = {}
         metrics["lexical"]["f1"] = calculate_f1_score(gold_tokens, response_tokens)
@@ -341,7 +339,7 @@ async def main():
     frame = "cot"
     config = ExperimentConfig()
     version = config.experiment_name
-    num_runs = 3
+    num_runs = int(os.environ.get("HYPERMEM_JUDGE_RUNS", "1"))
     options = ["lexical", "semantic"]
     max_workers = 10
 
@@ -359,7 +357,7 @@ async def main():
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Client Setup ---
-    llm_config = config.llm_config["openai"]
+    llm_config = config.judge_llm_config
     oai_client = AsyncOpenAI(
         api_key=llm_config["api_key"], base_url=llm_config["base_url"]
     )
@@ -373,7 +371,7 @@ async def main():
         return
 
     # --- Evaluation ---
-    num_users = 10
+    num_users = config.num_conv
     all_grades = {}
 
     total_responses_count = sum(

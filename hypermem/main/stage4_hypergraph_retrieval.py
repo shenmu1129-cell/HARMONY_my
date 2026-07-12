@@ -19,6 +19,7 @@ import pickle
 import json
 import asyncio
 from pathlib import Path
+import re
 import nltk
 import numpy as np
 from typing import List, Tuple, Dict, Any, Set, Optional
@@ -39,6 +40,22 @@ from hypermem.llm.reranker_provider import RerankerProvider
 from hypermem.config import ExperimentConfig
 
 console = Console()
+
+_FALLBACK_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+    "has", "he", "in", "is", "it", "its", "of", "on", "that", "the",
+    "to", "was", "were", "will", "with", "i", "you", "my", "your",
+    "me", "we", "they", "their", "this", "what", "who", "where",
+    "when", "why", "how",
+}
+
+
+def get_stop_words() -> set:
+    try:
+        return set(stopwords.words("english"))
+    except Exception as e:
+        print(f"Warning: using fallback stopwords because NLTK stopwords are unavailable: {e}")
+        return _FALLBACK_STOPWORDS
 
 # RRF (Reciprocal Rank Fusion) constant
 RRF_K = 60  # k value in the RRF formula, typically set to 60
@@ -214,16 +231,11 @@ def is_temporal_question(query: str) -> bool:
 
 
 def ensure_nltk_data():
-    """Ensure NLTK data is downloaded"""
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt", quiet=True)
-
+    """Avoid blocking on NLTK downloads; fall back when data is unavailable."""
     try:
         nltk.data.find("corpora/stopwords")
-    except LookupError:
-        nltk.download("stopwords", quiet=True)
+    except Exception as e:
+        print(f"Warning: NLTK stopwords unavailable, using fallback list: {e}")
 
 
 def tokenize(text: str, stemmer, stop_words: set) -> list[str]:
@@ -241,7 +253,7 @@ def tokenize(text: str, stemmer, stop_words: set) -> list[str]:
     if not text:
         return []
 
-    tokens = word_tokenize(text.lower())
+    tokens = re.findall(r"[a-zA-Z]+", text.lower())
     
     processed_tokens = [
         stemmer.stem(token) 
@@ -273,7 +285,7 @@ def search_with_bm25(
         List of (document data, score) tuples (returns content of the data field)
     """
     stemmer = PorterStemmer()
-    stop_words = set(stopwords.words("english"))
+    stop_words = get_stop_words()
     tokenized_query = tokenize(query, stemmer, stop_words)
     
     if not tokenized_query:
@@ -1338,4 +1350,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

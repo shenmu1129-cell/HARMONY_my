@@ -17,6 +17,7 @@ import json
 import pickle
 import asyncio
 from pathlib import Path
+import re
 from typing import Dict, List, Any
 from collections import defaultdict
 
@@ -40,18 +41,29 @@ from hypermem.llm.embedding_provider import EmbeddingProvider
 
 console = Console()
 
+_FALLBACK_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+    "has", "he", "in", "is", "it", "its", "of", "on", "that", "the",
+    "to", "was", "were", "will", "with", "i", "you", "my", "your",
+    "me", "we", "they", "their", "this", "what", "who", "where",
+    "when", "why", "how",
+}
+
 
 def ensure_nltk_data():
-    """Ensure NLTK data is downloaded"""
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt", quiet=True)
-
+    """Avoid blocking on NLTK downloads; fall back when data is unavailable."""
     try:
         nltk.data.find("corpora/stopwords")
-    except LookupError:
-        nltk.download("stopwords", quiet=True)
+    except Exception as e:
+        print(f"Warning: NLTK stopwords unavailable, using fallback list: {e}")
+
+
+def get_stop_words() -> set:
+    try:
+        return set(stopwords.words("english"))
+    except Exception as e:
+        print(f"Warning: using fallback stopwords because NLTK stopwords are unavailable: {e}")
+        return _FALLBACK_STOPWORDS
 
 
 def tokenize(text: str, stemmer: PorterStemmer, stop_words: set) -> List[str]:
@@ -69,7 +81,7 @@ def tokenize(text: str, stemmer: PorterStemmer, stop_words: set) -> List[str]:
     if not text:
         return []
 
-    tokens = word_tokenize(text.lower())
+    tokens = re.findall(r"[a-zA-Z]+", text.lower())
     
     processed_tokens = [
         stemmer.stem(token) 
@@ -355,7 +367,7 @@ async def build_bm25_index_for_hypergraph(
     console.print("Ensuring NLTK data is available...")
     ensure_nltk_data()
     stemmer = PorterStemmer()
-    stop_words = set(stopwords.words("english"))
+    stop_words = get_stop_words()
     
     # Create semaphore for concurrency control
     semaphore = asyncio.Semaphore(max_workers)
@@ -1019,4 +1031,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
